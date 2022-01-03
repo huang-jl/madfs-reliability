@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     io,
     net::SocketAddr,
     sync::{Arc, Mutex},
@@ -8,11 +7,20 @@ use std::{
 use crate::{
     constant::*,
     service::{Service, ServiceInput},
-    Error, ForwardReq,
+    ForwardReq,
 };
 use futures::{stream::FuturesUnordered, Future, StreamExt};
-use log::{error, info};
+use log::info;
 use madsim::net::{rpc::Request, NetLocalHandle};
+use serde::{Deserialize, Serialize};
+
+#[derive(thiserror::Error, Debug, Serialize, Deserialize)]
+pub enum ServerError {
+    #[error("The requested server is not primary")]
+    NotPrimary,
+    #[error("Network error: {0}")]
+    NetworkError(String),
+}
 
 pub struct ReliableCtl<T>
 where
@@ -43,12 +51,6 @@ where
     primary: bool,
 }
 
-#[derive(Copy, Clone, Debug)]
-enum Decision {
-    Commit,
-    Abort,
-}
-
 #[madsim::service]
 impl<T> ReliableCtl<T>
 where
@@ -69,13 +71,13 @@ where
 
     #[rpc]
     /// Handler for request directly from client
-    async fn handle_request(&self, request: T::Input) -> Result<T::Output, Error> {
+    async fn handle_request(&self, request: T::Input) -> Result<T::Output, ServerError> {
         info!("Receive request from client: {:?}", request);
         if request.check_modify_operation() {
             if self.inner.lock().unwrap().primary {
                 self.modification_by_primary(request).await
             } else {
-                Err(Error::NotPrimary)
+                Err(ServerError::NotPrimary)
             }
         } else {
             Ok(self.inner.lock().unwrap().service.dispatch_read(request))
@@ -84,23 +86,19 @@ where
 
     #[rpc]
     /// Handler for the first phase for 2pc, which comes from primary server
-    async fn handle_forward(&self, request: ForwardReq<T::Input>) -> Result<(), Error> {
+    async fn handle_forward(&self, request: ForwardReq<T::Input>) {
         info!("Get forward request: {:?}", request);
         let ForwardReq { op } = request;
         self.inner.lock().unwrap().apply_modification_to_service(op);
-        Ok(())
     }
 
-    async fn modification_by_primary(&self, request: T::Input) -> Result<T::Output, Error> {
+    async fn modification_by_primary(&self, request: T::Input) -> Result<T::Output, ServerError> {
         let mut tasks = {
             let inner = self.inner.lock().unwrap();
             inner.gen_forward_task(&request)
         };
         for res in tasks.next().await {
-            match res {
-                Ok(_) => {}
-                Err(err) => return Err(err),
-            }
+            res?
         }
         Ok(self
             .inner
@@ -120,7 +118,7 @@ where
     fn gen_forward_task(
         &self,
         args: &T::Input,
-    ) -> FuturesUnordered<impl Future<Output = Result<(), Error>>> {
+    ) -> FuturesUnordered<impl Future<Output = Result<(), ServerError>>> {
         assert!(args.check_modify_operation());
 
         let tasks = FuturesUnordered::new();
@@ -134,15 +132,15 @@ where
                         .call_timeout(peer.to_owned(), request, FORWARD_TIMEOUT)
                         .await
                     {
-                        Ok(res) => return res,
+                        Ok(_) => return Ok(()),
                         Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-                        Err(err) => return Err(Error::IoError(err.to_string())),
+                        Err(err) => return Err(ServerError::NetworkError(err.to_string())),
                     }
                 }
-                Err(Error::RetryNotSuccess {
-                    request_type: "ForwardReq".to_owned(),
-                    retry_times: FORWARD_RETRY,
-                })
+                Err(ServerError::NetworkError(format!(
+                    "Forward Request cannot get response from {}, retry {} times",
+                    peer, FORWARD_RETRY
+                )))
             });
         }
         tasks

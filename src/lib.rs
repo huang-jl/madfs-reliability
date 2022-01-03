@@ -6,33 +6,38 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod ctl;
+pub mod monitor;
 pub mod service;
+mod distributor;
 
 #[cfg(test)]
-mod test;
+pub mod test;
 
 mod constant {
     use std::time::Duration;
 
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(2000);
     pub const FORWARD_RETRY: u32 = 3;
+
+    pub const MONITOR_CHECK_PERIOD: Duration = Duration::from_millis(2000);
+    pub const DOWN_TIMEOUT: Duration = Duration::from_millis(10_000);
+    pub const OUT_TIMEOUT: Duration = Duration::from_millis(20_000);
+
+    pub const HEARTBEAT_PERIOD: Duration = Duration::from_millis(3000);
 }
 
-#[derive(Error, Debug, Serialize, Deserialize)]
+#[derive(Error, Debug)]
 pub enum Error {
-    #[error("Request {request_type} has been timeout and retry {retry_times} times still failed")]
-    RetryNotSuccess{
-        request_type: String,
-        retry_times: u32,
-    },
+    #[error("Error from service: {0}")]
+    ServerError(#[from] ctl::ServerError),
     #[error("Io relevant errors occur: {0}")]
-    IoError(String),
-    #[error("The requested server is not primary")]
-    NotPrimary,
+    IoError(#[from] std::io::Error),
+    #[error("Error from monitor: {0}")]
+    MonitorError(#[from] monitor::MonitorError),
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Request)]
-#[rtype("Result<(), Error>")]
+#[rtype("()")]
 /// Request forwarded to Secondary by Primary
 struct ForwardReq<T>
 where

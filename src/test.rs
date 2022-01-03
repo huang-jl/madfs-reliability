@@ -6,7 +6,13 @@ use crate::{
 use log::*;
 use madsim::{net::NetLocalHandle, Handle, LocalHandle};
 use rand::{thread_rng, Rng};
-use std::{io, net::SocketAddr, time::Duration};
+use std::{io::{self, ErrorKind}, net::SocketAddr, time::Duration};
+
+#[derive(thiserror::Error, Debug)]
+enum ClientError {
+    #[error("")]
+    IoError(#[from] std::io::Error),
+}
 
 struct KvServerCluster {
     servers: Vec<ReliableCtl<KvService>>,
@@ -110,19 +116,17 @@ impl Client {
                     Some(retry) => {
                         for _ in 0..retry {
                             match net.call_timeout(target, request.clone(), TIMEOUT).await {
-                                Ok(res) => return res,
+                                Ok(res) => return res.map_err(|err| err.into()),
                                 Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-                                Err(err) => return Err(Error::IoError(err.to_string())),
+                                Err(err) => return Err(Error::IoError(err)),
                             }
                         }
-                        Err(Error::RetryNotSuccess {
-                            request_type: "KvArgs".to_owned(),
-                            retry_times: retry,
-                        })
+                        Err(Error::IoError(std::io::Error::from(ErrorKind::TimedOut)))
+                        
                     }
                     None => match net.call_timeout(target, request, TIMEOUT).await {
-                        Ok(res) => return res,
-                        Err(err) => return Err(Error::IoError(err.to_string())),
+                        Ok(res) => return res.map_err(|err| err.into()),
+                        Err(err) => return Err(Error::IoError(err)),
                     },
                 }
             })

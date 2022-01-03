@@ -1,4 +1,4 @@
-use crate::Error;
+use crate::ctl::ServerError;
 use madsim::net::rpc::{Request as Req, Serialize};
 use madsim::Request;
 use serde::Deserialize;
@@ -11,7 +11,7 @@ pub trait ServiceInput {
 }
 
 pub trait Service {
-    type Input: ServiceInput + Req<Response = Result<Self::Output, Error>> + Clone + Debug;
+    type Input: ServiceInput + Req<Response = Result<Self::Output, ServerError>> + Clone + Debug;
     type Output;
     /// Dispatch args to the inner method. We only care about *modify* operations here.
     fn dispatch_write(&mut self, args: Self::Input) -> Self::Output;
@@ -23,7 +23,7 @@ pub struct KvService {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Request)]
-#[rtype("Result<KvRes, Error>")]
+#[rtype("Result<KvRes, ServerError>")]
 pub enum KvArgs {
     Put { key: String, value: String },
     Get(String),
