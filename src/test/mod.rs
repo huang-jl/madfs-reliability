@@ -9,6 +9,7 @@ pub mod common;
 #[madsim::test]
 async fn cluster_simple_test() {
     use self::common::*;
+    use crate::constant::*;
 
     const PG_NUM: usize = 256;
     const SERVER_NUM: usize = 10;

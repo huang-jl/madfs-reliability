@@ -6,9 +6,9 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod ctl;
+mod distributor;
 pub mod monitor;
 pub mod service;
-mod distributor;
 
 #[cfg(test)]
 pub mod test;
@@ -17,6 +17,7 @@ mod constant {
     use std::time::Duration;
 
     pub const REPLICA_SIZE: usize = 3;
+    pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
 
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(2000);
     pub const FORWARD_RETRY: u32 = 3;

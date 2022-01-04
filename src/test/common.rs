@@ -19,8 +19,6 @@ use std::{
     time::Duration,
 };
 
-pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
-
 #[derive(thiserror::Error, Debug)]
 enum ClientError {
     #[error("")]

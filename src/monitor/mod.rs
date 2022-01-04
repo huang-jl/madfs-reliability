@@ -325,6 +325,10 @@ impl PgMap {
 }
 
 impl TargetInfo {
+    pub fn new(id: u64, state: TargetState) -> Self {
+        TargetInfo { id, state }
+    }
+
     pub fn get_addr(&self) -> Option<SocketAddr> {
         match self.state {
             TargetState::UpIn(addr) => Some(addr),
@@ -340,5 +344,9 @@ impl TargetInfo {
 
     pub fn is_down_in(&self) -> bool {
         matches!(self.state, TargetState::DownIn)
+    }
+
+    pub fn is_in(&self) -> bool {
+        matches!(self.state, TargetState::UpIn(..) | TargetState::DownIn)
     }
 }
