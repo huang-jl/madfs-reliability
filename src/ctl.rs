@@ -1,18 +1,15 @@
-use std::{
-    io,
-    net::SocketAddr,
-    sync::{Arc, Mutex},
-};
-
 use crate::{
     constant::*,
+    distributor::{Distributor, SimpleHashDistributor},
+    monitor::{client::ServerClient, PgMap, TargetMap},
     service::{Service, ServiceInput},
     ForwardReq,
 };
-use futures::{stream::FuturesUnordered, Future, StreamExt};
+use futures::{lock::Mutex, stream::FuturesUnordered, Future, StreamExt};
 use log::info;
-use madsim::net::{rpc::Request, NetLocalHandle};
+use madsim::net::NetLocalHandle;
 use serde::{Deserialize, Serialize};
+use std::{io, net::SocketAddr, sync::Arc};
 
 #[derive(thiserror::Error, Debug, Serialize, Deserialize)]
 pub enum ServerError {
@@ -22,10 +19,8 @@ pub enum ServerError {
     NetworkError(String),
 }
 
-pub struct ReliableCtl<T>
-where
-    T: Service,
-{
+#[derive(Debug)]
+pub struct ReliableCtl<T> {
     inner: Arc<Mutex<Inner<T>>>,
 }
 
@@ -42,27 +37,23 @@ where
     }
 }
 
-struct Inner<T>
-where
-    T: Service,
-{
+struct Inner<T> {
     service: T,
-    peers: Vec<SocketAddr>,
-    primary: bool,
+    monitor_client: Arc<ServerClient>,
+    distributor: Box<dyn Distributor<REPLICA_SIZE>>,
 }
 
 #[madsim::service]
 impl<T> ReliableCtl<T>
 where
-    T: Service + Send + 'static,
-    <T as Service>::Input: Request,
+    T: Service + Sync + Send + 'static,
 {
-    pub fn new(service: T, peers: Vec<SocketAddr>, primary: bool) -> Self {
+    pub fn new(service: T, monitor_client: Arc<ServerClient>) -> Self {
         let ctl = ReliableCtl {
             inner: Arc::new(Mutex::new(Inner {
                 service,
-                peers,
-                primary,
+                monitor_client,
+                distributor: Box::new(SimpleHashDistributor),
             })),
         };
         ctl.add_rpc_handler();
@@ -74,13 +65,14 @@ where
     async fn handle_request(&self, request: T::Input) -> Result<T::Output, ServerError> {
         info!("Receive request from client: {:?}", request);
         if request.check_modify_operation() {
-            if self.inner.lock().unwrap().primary {
+            let target_addrs = self.inner.lock().await.get_target_addrs(&request).await;
+            if self.local_addr() == target_addrs[0] {
                 self.modification_by_primary(request).await
             } else {
                 Err(ServerError::NotPrimary)
             }
         } else {
-            Ok(self.inner.lock().unwrap().service.dispatch_read(request))
+            Ok(self.inner.lock().await.service.dispatch_read(request))
         }
     }
 
@@ -89,13 +81,13 @@ where
     async fn handle_forward(&self, request: ForwardReq<T::Input>) {
         info!("Get forward request: {:?}", request);
         let ForwardReq { op } = request;
-        self.inner.lock().unwrap().apply_modification_to_service(op);
+        self.inner.lock().await.apply_modification_to_service(op);
     }
 
     async fn modification_by_primary(&self, request: T::Input) -> Result<T::Output, ServerError> {
         let mut tasks = {
-            let inner = self.inner.lock().unwrap();
-            inner.gen_forward_task(&request)
+            let inner = self.inner.lock().await;
+            inner.gen_forward_task(&request).await
         };
         for res in tasks.next().await {
             res?
@@ -103,8 +95,12 @@ where
         Ok(self
             .inner
             .lock()
-            .unwrap()
+            .await
             .apply_modification_to_service(request))
+    }
+
+    fn local_addr(&self) -> SocketAddr {
+        NetLocalHandle::current().local_addr()
     }
 }
 
@@ -115,14 +111,16 @@ where
     /*
      * The following methods are used by primary
      */
-    fn gen_forward_task(
+    async fn gen_forward_task(
         &self,
         args: &T::Input,
     ) -> FuturesUnordered<impl Future<Output = Result<(), ServerError>>> {
         assert!(args.check_modify_operation());
-
+        // 1. Locate the peer servers
+        let peers = self.get_target_addrs(args).await;
+        // 2. Send request to peers
         let tasks = FuturesUnordered::new();
-        for peer in self.peers.clone() {
+        for peer in peers {
             let args = args.clone();
             tasks.push(async move {
                 let net = NetLocalHandle::current();
@@ -153,5 +151,20 @@ where
     fn apply_modification_to_service(&mut self, op: T::Input) -> T::Output {
         assert!(op.check_modify_operation());
         self.service.dispatch_write(op)
+    }
+
+    async fn get_target_map(&self) -> TargetMap {
+        self.monitor_client.get_local_target_map().await
+    }
+
+    async fn get_pg_map(&self) -> PgMap {
+        self.monitor_client.get_local_pg_map().await
+    }
+
+    async fn get_target_addrs(&self, args: &T::Input) -> [SocketAddr; REPLICA_SIZE] {
+        let pgid = self
+            .distributor
+            .assign_pgid(args.key_bytes(), &self.get_pg_map().await);
+        self.distributor.locate(pgid, &self.get_target_map().await)
     }
 }

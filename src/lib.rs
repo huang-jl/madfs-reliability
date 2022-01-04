@@ -16,6 +16,8 @@ pub mod test;
 mod constant {
     use std::time::Duration;
 
+    pub const REPLICA_SIZE: usize = 3;
+
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(2000);
     pub const FORWARD_RETRY: u32 = 3;
 

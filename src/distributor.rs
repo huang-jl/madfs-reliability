@@ -13,18 +13,18 @@ pub trait Distributor<const REPLICA_SIZE: usize>: Send + Sync {
     fn locate(&self, pgid: PgId, target_map: &TargetMap) -> [SocketAddr; REPLICA_SIZE];
 }
 
-struct SimpleHashDistributor<const N: usize>;
+pub struct SimpleHashDistributor<const N: usize>;
 
 impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {
     fn locate(&self, pgid: PgId, target_map: &TargetMap) -> [SocketAddr; N] {
-        let mut hasher = AHasher::default();
         let mut ans = ["0.0.0.0:1".parse().unwrap(); N];
         let mut start = 0;
         let mut count = 0;
         while count < N {
+            let mut hasher = AHasher::default();
             pgid.hash(&mut hasher);
             start.hash(&mut hasher);
-            let host_id = hasher.finish() as usize;
+            let host_id = hasher.finish() as usize % target_map.len();
             match target_map.map[host_id].get_addr() {
                 Some(addr) => {
                     ans[count] = addr;

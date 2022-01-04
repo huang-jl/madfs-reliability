@@ -289,6 +289,10 @@ impl TargetMap {
     pub fn get_version(&self) -> TargetMapVersion {
         self.version
     }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
 }
 
 impl PgMap {

@@ -1,12 +1,13 @@
 use crate::ctl::ServerError;
+use log::info;
 use madsim::net::rpc::{Request as Req, Serialize};
 use madsim::Request;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fmt::Debug;
-use log::info;
 
 pub trait ServiceInput {
+    fn key_bytes(&self) -> &[u8];
     fn check_modify_operation(&self) -> bool;
 }
 
@@ -40,6 +41,13 @@ impl ServiceInput for KvArgs {
         match self {
             KvArgs::Put { .. } => true,
             _ => false,
+        }
+    }
+
+    fn key_bytes(&self) -> &[u8] {
+        match self {
+            KvArgs::Get(key) => key.as_bytes(),
+            KvArgs::Put { key, .. } => key.as_bytes(),
         }
     }
 }
