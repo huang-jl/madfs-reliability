@@ -15,6 +15,8 @@ use std::{io, net::SocketAddr, sync::Arc};
 pub enum ServerError {
     #[error("The requested server is not primary")]
     NotPrimary,
+    #[error("The target is not responsible for the request's key")]
+    WrongTarget,
     #[error("Network error: {0}")]
     NetworkError(String),
 }
@@ -61,27 +63,35 @@ where
     }
 
     #[rpc]
-    /// Handler for request directly from client
+    /// Handler for request directly from client.
     async fn handle_request(&self, request: T::Input) -> Result<T::Output, ServerError> {
         info!("Receive request from client: {:?}", request);
         if request.check_modify_operation() {
-            let target_addrs = self.inner.lock().await.get_target_addrs(&request).await;
-            if self.local_addr() == target_addrs[0] {
+            if self.is_primary(&request).await {
                 self.modification_by_primary(request).await
             } else {
                 Err(ServerError::NotPrimary)
             }
         } else {
-            Ok(self.inner.lock().await.service.dispatch_read(request))
+            if self.is_primary(&request).await || self.is_secondary(&request).await
+            {
+                Err(ServerError::WrongTarget)
+            } else {
+                Ok(self.inner.lock().await.service.dispatch_read(request))
+            }
         }
     }
 
     #[rpc]
-    /// Handler for the first phase for 2pc, which comes from primary server
-    async fn handle_forward(&self, request: ForwardReq<T::Input>) {
+    /// Handle forward request from primary.
+    async fn handle_forward(&self, request: ForwardReq<T::Input>) -> Result<(), ServerError> {
         info!("Get forward request: {:?}", request);
-        let ForwardReq { op } = request;
-        self.inner.lock().await.apply_modification_to_service(op);
+        let ForwardReq { op: args } = request;
+        if !self.is_secondary(&args).await {
+            return Err(ServerError::WrongTarget);
+        }
+        self.inner.lock().await.apply_modification_to_service(args);
+        Ok(())
     }
 
     async fn modification_by_primary(&self, request: T::Input) -> Result<T::Output, ServerError> {
@@ -99,8 +109,26 @@ where
             .apply_modification_to_service(request))
     }
 
+    /*
+     * Helper methods
+     */
+
     fn local_addr(&self) -> SocketAddr {
         NetLocalHandle::current().local_addr()
+    }
+
+    async fn is_primary(&self, input: &T::Input) -> bool {
+        let target_addrs = self.inner.lock().await.get_target_addrs(&input).await;
+        self.local_addr() == target_addrs[0]
+    }
+
+    async fn is_secondary(&self, input: &T::Input) -> bool {
+        let target_addrs = self.inner.lock().await.get_target_addrs(&input).await;
+        target_addrs
+            .iter()
+            .skip(1)
+            .find(|addr| **addr == self.local_addr())
+            .is_some()
     }
 }
 
@@ -145,7 +173,7 @@ where
     }
 
     /*
-     * The following methods are used by secondary
+     * Helper methods
      */
 
     fn apply_modification_to_service(&mut self, op: T::Input) -> T::Output {

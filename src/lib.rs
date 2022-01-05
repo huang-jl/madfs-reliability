@@ -40,7 +40,7 @@ pub enum Error {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Request)]
-#[rtype("()")]
+#[rtype("Result<(), ctl::ServerError>")]
 /// Request forwarded to Secondary by Primary
 struct ForwardReq<T>
 where

@@ -26,17 +26,19 @@ async fn cluster_simple_test() {
         MonitorClient::new(str_to_addr(MONITOR_ADDR)).await.unwrap(),
     );
 
-    let request = gen_random_put(10, 20);
-    let res = client.send(request.clone(), None).await;
-    assert!(matches!(res, Ok(KvRes::Put)));
+    for _ in 0..100 {
+        let request = gen_random_put(10, 20);
+        let res = client.send(request.clone(), None).await;
+        assert!(matches!(res, Ok(KvRes::Put)));
 
-    let targets = client.get_target_addrs(&request).await;
-    for target in targets {
-        let key = request.get_key();
-        let res = client.send_to(KvArgs::Get(key), target, None).await;
-        assert_eq!(
-            res.unwrap().get_value().unwrap(),
-            request.get_value().unwrap()
-        );
+        let targets = client.get_target_addrs(&request).await;
+        for target in targets {
+            let key = request.get_key();
+            let res = client.send_to(KvArgs::Get(key), target, None).await;
+            assert_eq!(
+                res.unwrap().get_value().unwrap(),
+                request.get_value().unwrap()
+            );
+        }
     }
 }

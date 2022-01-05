@@ -125,7 +125,7 @@ impl Client {
         target: SocketAddr,
         retry: Option<u32>,
     ) -> Result<KvRes, Error> {
-        const TIMEOUT: Duration = Duration::from_millis(2000);
+        const TIMEOUT: Duration = Duration::from_millis(10_000);
         self.handle
             .spawn(async move {
                 let net = NetLocalHandle::current();
