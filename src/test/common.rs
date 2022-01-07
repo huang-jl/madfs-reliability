@@ -6,11 +6,15 @@ use crate::{
         client::{Client as MonitorClient, ServerClient},
         Monitor,
     },
-    service::{KvArgs, KvRes, KvService, ServiceInput},
-    Error, PgId,
+    rpc::KvRequest,
+    service::KvService,
+    Error, Result,
 };
 use log::*;
-use madsim::{net::NetLocalHandle, Handle, LocalHandle};
+use madsim::{
+    net::{rpc::Request, NetLocalHandle},
+    Handle, LocalHandle,
+};
 use rand::{thread_rng, Rng};
 use std::{
     io::{self, ErrorKind},
@@ -40,7 +44,7 @@ pub struct Client {
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
 }
 
-pub fn gen_random_put(key_len: usize, val_len: usize) -> KvArgs {
+pub fn gen_random_put(key_len: usize, val_len: usize) -> (String, String) {
     let mut chartset = Vec::new();
     for i in 'A'..'Z' {
         chartset.push(i);
@@ -58,10 +62,7 @@ pub fn gen_random_put(key_len: usize, val_len: usize) -> KvArgs {
             })
             .collect()
     };
-    KvArgs::Put {
-        key: gen_random(key_len),
-        value: gen_random(val_len),
-    }
+    (gen_random(key_len), gen_random(val_len))
 }
 
 /// - `pg_num` - total number of placement group
@@ -107,23 +108,34 @@ impl Client {
         client
     }
 
-    pub async fn send(&self, request: KvArgs, retry: Option<u32>) -> Result<KvRes, Error> {
-        let targets = self.get_target_addrs(&request).await;
+    pub async fn send<T>(
+        &self,
+        request: T,
+        retry: Option<u32>,
+    ) -> Result<<T as Request>::Response>
+    where
+        T: KvRequest + Clone,
+    {
+        let targets = self.get_target_addrs(&request.key().as_bytes()).await;
         self.send_to(request, targets[0], retry).await
     }
 
-    pub async fn get_target_addrs(&self, request: &KvArgs) -> [SocketAddr; REPLICA_SIZE] {
-        let pgid = self.distributor.assign_pgid(request.key_bytes());
+    pub async fn get_target_addrs(&self, key: &[u8]) -> [SocketAddr; REPLICA_SIZE]
+    {
+        let pgid = self.distributor.assign_pgid(key);
         let target_map = self.monitor_client.get_local_target_map().await;
         self.distributor.locate(pgid, &target_map)
     }
 
-    pub async fn send_to(
+    pub async fn send_to<T>(
         &self,
-        request: KvArgs,
+        request: T,
         target: SocketAddr,
         retry: Option<u32>,
-    ) -> Result<KvRes, Error> {
+    ) -> Result<<T as Request>::Response>
+    where
+        T: KvRequest + Clone,
+    {
         const TIMEOUT: Duration = Duration::from_millis(10_000);
         // Add pgid prefix to the requesting key
         self.handle
@@ -133,16 +145,18 @@ impl Client {
                     Some(retry) => {
                         for _ in 0..retry {
                             match net.call_timeout(target, request.clone(), TIMEOUT).await {
-                                Ok(res) => return res.map_err(|err| err.into()),
+                                Ok(res) => return Ok(res),
                                 Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-                                Err(err) => return Err(Error::IoError(err)),
+                                Err(err) => return Err(Error::NetworkError(err.to_string())),
                             }
                         }
-                        Err(Error::IoError(std::io::Error::from(ErrorKind::TimedOut)))
+                        Err(Error::NetworkError(
+                            std::io::Error::from(ErrorKind::TimedOut).to_string(),
+                        ))
                     }
                     None => match net.call_timeout(target, request, TIMEOUT).await {
-                        Ok(res) => return res.map_err(|err| err.into()),
-                        Err(err) => return Err(Error::IoError(err)),
+                        Ok(res) => return Ok(res),
+                        Err(err) => return Err(Error::NetworkError(err.to_string())),
                     },
                 }
             })

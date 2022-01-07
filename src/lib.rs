@@ -8,6 +8,7 @@ use thiserror::Error;
 pub mod ctl;
 mod distributor;
 pub mod monitor;
+pub mod rpc;
 pub mod service;
 
 #[cfg(test)]
@@ -30,46 +31,24 @@ mod constant {
     pub const HEARTBEAT_PERIOD: Duration = Duration::from_millis(3000);
 }
 
-
 pub type PgId = usize;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, Serialize, Deserialize)]
 pub enum Error {
-    #[error("Error from service: {0}")]
-    ServerError(#[from] ctl::ServerError),
-    #[error("Io relevant errors occur: {0}")]
-    IoError(#[from] std::io::Error),
-    #[error("Error from monitor: {0}")]
-    MonitorError(#[from] monitor::MonitorError),
+    #[error("The requested server is not primary")]
+    NotPrimary,
+    #[error("The target is not responsible for the request's key")]
+    WrongTarget,
+    #[error("Network error: {0}")]
+    NetworkError(String),
+    #[error("Version {0} does not exist in monitor")]
+    VersionDoesNotExist(u64),
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, Request)]
-#[rtype("Result<(), ctl::ServerError>")]
-/// Request forwarded to Secondary by Primary
-struct ForwardReq<T>
-where
-    T: Send + Sync + Serialize + DeserializeOwned + 'static,
-{
-    #[serde(bound = "")]
-    op: T,
-}
-
-impl<T> Deref for ForwardReq<T>
-where
-    T: Send + Sync + Serialize + DeserializeOwned + 'static,
-{
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.op
+impl From<std::io::Error> for Error {
+    fn from(err: std::io::Error) -> Self {
+        Error::NetworkError(err.to_string())
     }
 }
 
-impl<T> ForwardReq<T>
-where
-    T: Send + Sync + Serialize + DeserializeOwned + 'static,
-{
-    pub fn new(op: T) -> Self {
-        Self { op }
-    }
-}
+type Result<T> = std::result::Result<T, Error>;

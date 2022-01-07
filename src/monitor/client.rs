@@ -1,8 +1,5 @@
-use super::{
-    FetchPgMapReq, FetchTargetMapReq, HeartBeat, PgMap, TargetInfo, TargetMap, TargetMapVersion,
-    TargetState,
-};
-use crate::{constant::*, monitor::MonitorError, Error};
+use super::{PgMap, TargetInfo, TargetMap, TargetMapVersion, TargetState};
+use crate::{constant::*, rpc::*, Error, Result};
 use futures::lock::Mutex;
 use madsim::{net::NetLocalHandle, task, time::sleep};
 use std::{net::SocketAddr, sync::Arc};
@@ -25,11 +22,10 @@ pub struct Client {
     pg_map: Mutex<PgMap>,
 }
 
-
 impl ServerClient {
     ///* `id` - Id of current Server
     ///* `addr` - Address of monitor
-    pub async fn new(id: u64, addr: SocketAddr) -> Result<Arc<ServerClient>, Error> {
+    pub async fn new(id: u64, addr: SocketAddr) -> Result<Arc<ServerClient>> {
         let net = NetLocalHandle::current();
         let heartbeat = HeartBeat {
             target_map_version: 0,
@@ -83,15 +79,12 @@ impl ServerClient {
         self.pg_map.lock().await.clone()
     }
 
-    pub async fn fetch_target_map(
-        &self,
-        version: Option<TargetMapVersion>,
-    ) -> Option<TargetMap> {
+    pub async fn fetch_target_map(&self, version: Option<TargetMapVersion>) -> Option<TargetMap> {
         let net = NetLocalHandle::current();
         match net.call(self.addr, FetchTargetMapReq(version)).await {
             Ok(Ok(map)) => Some(map),
             Ok(Err(err)) => {
-                assert!(matches!(err, MonitorError::DoesNotExist(..)));
+                assert!(matches!(err, Error::VersionDoesNotExist(..)));
                 None
             }
             Err(err) => {
@@ -105,7 +98,7 @@ impl ServerClient {
         match net.call(self.addr, FetchPgMapReq(version)).await {
             Ok(Ok(map)) => Some(map),
             Ok(Err(err)) => {
-                assert!(matches!(err, MonitorError::DoesNotExist(..)));
+                assert!(matches!(err, Error::VersionDoesNotExist(..)));
                 None
             }
             Err(err) => {
@@ -128,7 +121,7 @@ impl ServerClient {
 impl Client {
     ///* `id` - Id of current Server
     ///* `addr` - Address of monitor
-    pub async fn new(addr: SocketAddr) -> Result<Arc<Client>, Error> {
+    pub async fn new(addr: SocketAddr) -> Result<Arc<Client>> {
         let net = NetLocalHandle::current();
         let request = FetchTargetMapReq(None);
         let target_map = net.call(addr, request).await?.unwrap();
@@ -151,15 +144,12 @@ impl Client {
         self.pg_map.lock().await.clone()
     }
 
-    pub async fn fetch_target_map(
-        &self,
-        version: Option<TargetMapVersion>,
-    ) -> Option<TargetMap> {
+    pub async fn fetch_target_map(&self, version: Option<TargetMapVersion>) -> Option<TargetMap> {
         let net = NetLocalHandle::current();
         match net.call(self.addr, FetchTargetMapReq(version)).await {
             Ok(Ok(map)) => Some(map),
             Ok(Err(err)) => {
-                assert!(matches!(err, MonitorError::DoesNotExist(..)));
+                assert!(matches!(err, Error::VersionDoesNotExist(..)));
                 None
             }
             Err(err) => {
@@ -173,7 +163,7 @@ impl Client {
         match net.call(self.addr, FetchPgMapReq(version)).await {
             Ok(Ok(map)) => Some(map),
             Ok(Err(err)) => {
-                assert!(matches!(err, MonitorError::DoesNotExist(..)));
+                assert!(matches!(err, Error::VersionDoesNotExist(..)));
                 None
             }
             Err(err) => {

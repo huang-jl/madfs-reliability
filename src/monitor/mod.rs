@@ -1,9 +1,8 @@
-use crate::constant::*;
+use crate::{constant::*, rpc::*, Error, Result};
 use log::{info, warn};
 use madsim::{
     task,
     time::{sleep, Instant},
-    Request,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -86,36 +85,6 @@ pub enum PgState {
     Stale,    // All nodes is down
 }
 
-#[derive(Debug, thiserror::Error, Serialize, Deserialize)]
-pub enum MonitorError {
-    #[error("Version {0} does not exist in monitor")]
-    DoesNotExist(u64),
-}
-
-type Result<T> = std::result::Result<T, MonitorError>;
-
-#[derive(Debug, Serialize, Deserialize, Request)]
-#[rtype("Result<TargetMap>")]
-struct FetchTargetMapReq(Option<TargetMapVersion>);
-
-#[derive(Debug, Serialize, Deserialize, Request)]
-#[rtype("Result<PgMap>")]
-struct FetchPgMapReq(Option<PgMapVersion>);
-
-#[derive(Debug, Serialize, Deserialize, Request)]
-#[rtype("HeartBeatRes")]
-struct HeartBeat {
-    target_map_version: TargetMapVersion,
-    pg_map_version: PgMapVersion,
-    target_info: TargetInfo,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct HeartBeatRes {
-    target_map: Option<TargetMap>,
-    pg_map: Option<PgMap>,
-}
-
 #[madsim::service]
 impl Monitor {
     pub fn new(pg_num: usize, server_addrs: Vec<SocketAddr>) -> Self {
@@ -181,7 +150,7 @@ impl Inner {
             Some(version) => self
                 .target_map
                 .get(&version)
-                .map_or(Err(MonitorError::DoesNotExist(version)), |map| {
+                .map_or(Err(Error::VersionDoesNotExist(version)), |map| {
                     Ok(map.clone())
                 }),
             None => Ok(self.target_map.values().next_back().unwrap().clone()),
@@ -193,7 +162,7 @@ impl Inner {
             Some(version) => self
                 .pg_map
                 .get(&version)
-                .map_or(Err(MonitorError::DoesNotExist(version)), |map| {
+                .map_or(Err(Error::VersionDoesNotExist(version)), |map| {
                     Ok(map.clone())
                 }),
             None => Ok(self.pg_map.values().next_back().unwrap().clone()),
