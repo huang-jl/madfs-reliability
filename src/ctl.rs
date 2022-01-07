@@ -1,19 +1,20 @@
 use crate::{
     constant::*,
     distributor::{Distributor, SimpleHashDistributor},
-    monitor::{client::ServerClient, PgMap, TargetMap},
-    rpc::{ForwardReq, Get, KvRequest, Put},
+    monitor::{client::ServerClient, TargetMap},
+    rpc::{ForwardReq, Get, KvRequest, Put, Recover},
     service::Store,
     Error, PgId, Result,
 };
-use futures::{lock::Mutex, stream::FuturesUnordered, Future, StreamExt};
-use log::info;
-use madsim::net::NetLocalHandle;
-use std::{io, net::SocketAddr, sync::Arc};
+use futures::{lock::Mutex, stream::FuturesUnordered, StreamExt};
+use log::{error, info, warn};
+use madsim::{net::NetLocalHandle, task};
+use std::{fmt::Debug, io, net::SocketAddr, sync::Arc};
 
-#[derive(Debug)]
 pub struct ReliableCtl<T> {
     inner: Arc<Mutex<Inner<T>>>,
+    monitor_client: Arc<ServerClient>,
+    distributor: Arc<dyn Distributor<REPLICA_SIZE>>,
 }
 
 // The #[derive(Clone)] bindly bind T: Clone, but we do not need it.
@@ -25,14 +26,40 @@ where
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
+            monitor_client: self.monitor_client.clone(),
+            distributor: self.distributor.clone(),
         }
     }
 }
 
 struct Inner<T> {
     service: T,
-    monitor_client: Arc<ServerClient>,
+    pg_infos: Vec<PgInfo>,
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PgInfo {
+    version: u64,
+    state: PgState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PgState {
+    Active,   // Everything is alright
+    Inactive, // This server do not responsible for this PG
+    Unclean,  // Recovery is happening
+    Stale,    // This pg on this server is out of date
+}
+
+impl PgInfo {
+    /// Default state is PgState::Inactive
+    pub fn new() -> Self {
+        PgInfo {
+            version: 0,
+            state: PgState::Inactive,
+        }
+    }
 }
 
 #[madsim::service]
@@ -44,29 +71,124 @@ where
         let ctl = ReliableCtl {
             inner: Arc::new(Mutex::new(Inner {
                 service,
-                monitor_client,
+                pg_infos: vec![PgInfo::new(); PG_NUM],
                 distributor: Box::new(SimpleHashDistributor),
             })),
+            monitor_client,
+            distributor: Arc::new(SimpleHashDistributor),
         };
         ctl.add_rpc_handler();
+        ctl.start_background_task();
         ctl
     }
 
     #[rpc]
     async fn get(&self, request: Get) -> Result<Option<String>> {
         info!("Receive Get from client: {:?}", request);
-        if self.is_primary(&request).await || self.is_secondary(&request).await {
+        if self.is_primary(request.key()) || self.is_secondary(request.key()) {
             Ok(self.inner.lock().await.get(request.key()))
         } else {
             Err(Error::WrongTarget)
         }
     }
 
+    fn start_background_task(&self) {
+        let this = self.clone();
+        task::spawn(async move {
+            this.background_recovery().await;
+        })
+        .detach();
+    }
+
+    /*
+     * Background task
+     */
+    async fn background_recovery(&self) {
+        loop {
+            let _ = self.monitor_client.watch_for_target_map().await;
+            let target_map = self.get_target_map();
+            for pgid in 0..PG_NUM {
+                let target_addrs = self.distributor.locate(pgid, &target_map);
+                if target_addrs
+                    .iter()
+                    .find(|addr| **addr == self.local_addr())
+                    .is_some()
+                {
+                    let local_info = self.inner.lock().await.pg_infos[pgid].clone();
+                    match local_info.state {
+                        PgState::Active => {
+                            todo!("If the current pg version is lagging, need to recovery [maybe another healing background task]")
+                        }
+                        PgState::Inactive => {
+                            warn!("Start recovering pg {}", pgid);
+                            if let Err(err) = self.recovery(pgid, target_addrs[0].clone()).await {
+                                error!(
+                                    "Error occur when recovering pg {} from primary {}: {}",
+                                    pgid, target_addrs[0], err
+                                );
+                                continue;
+                            }
+                        }
+                        PgState::Unclean => {
+                            // Indicates last time the recovery did not succedd
+                            warn!("Start recovering pg {} again: probably last time recovered incorrectly", pgid);
+                            if let Err(err) = self.recovery(pgid, target_addrs[0].clone()).await {
+                                error!(
+                                    "Error occur when recovering pg {} from primary {}: {}",
+                                    pgid, target_addrs[0], err
+                                );
+                                continue;
+                            }
+                        }
+                        PgState::Stale => {
+                            todo!("For now we did not cares about stale pgstate here")
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    async fn recovery(&self, pgid: PgId, primary: SocketAddr) -> Result<()> {
+        // 1. change the state of local pg
+        {
+            let mut inner = self.inner.lock().await;
+            inner.pg_infos[pgid].state = PgState::Unclean;
+        }
+        // 2. get whole pg data from primary
+        let net = NetLocalHandle::current();
+        let mut data: Option<Vec<u8>> = None;
+        for _ in 0..RECOVER_RETRY {
+            let request = Recover(pgid);
+            match net.call_timeout(primary, request, RECOVER_TIMEOUT).await {
+                Ok(res) => data = Some(res?),
+                Err(_) => continue,
+            }
+        }
+        // 3. push pg data into local
+        match data {
+            Some(data) => {
+                let mut inner = self.inner.lock().await;
+                inner.service.push_pg_data(pgid, data);
+                inner.pg_infos[pgid].state = PgState::Active;
+                Ok(())
+            }
+            None => Err(Error::NetworkError(format!(
+                "Recovery still error after retry for {} times",
+                RECOVER_RETRY
+            ))),
+        }
+    }
+
+    /*
+     * RPC Handler
+     */
+
     #[rpc]
     /// Handler for request directly from client.
     async fn put(&self, request: Put) -> Result<()> {
         info!("Receive Put from client: {:?}", request);
-        if self.is_primary(&request).await {
+        if self.is_primary(request.key()) {
             self.forward_put_by_primary(request.clone()).await?;
             Ok(self.inner.lock().await.put(
                 request.key().to_owned(),
@@ -82,7 +204,7 @@ where
     async fn forward(&self, request: ForwardReq<Put>) -> Result<()> {
         info!("Get forward put request: {:?}", request);
         let ForwardReq(request) = request;
-        if !self.is_secondary(&request).await {
+        if !self.is_secondary(request.key()) {
             return Err(Error::WrongTarget);
         }
         self.inner.lock().await.put(
@@ -93,63 +215,10 @@ where
     }
 
     async fn forward_put_by_primary(&self, request: Put) -> Result<()> {
-        let mut tasks = {
-            let inner = self.inner.lock().await;
-            inner.gen_forward_task(&request).await
-        };
-        for res in tasks.next().await {
-            res?
-        }
-        Ok(())
-    }
-
-    /*
-     * Helper methods
-     */
-
-    fn local_addr(&self) -> SocketAddr {
-        NetLocalHandle::current().local_addr()
-    }
-
-    async fn is_primary<R>(&self, input: &R) -> bool
-    where
-        R: KvRequest,
-    {
-        let target_addrs = self.inner.lock().await.get_target_addrs(input).await;
-        self.local_addr() == target_addrs[0]
-    }
-
-    async fn is_secondary<R>(&self, input: &R) -> bool
-    where
-        R: KvRequest,
-    {
-        let target_addrs = self.inner.lock().await.get_target_addrs(input).await;
-        target_addrs
-            .iter()
-            .skip(1)
-            .find(|addr| **addr == self.local_addr())
-            .is_some()
-    }
-}
-
-impl<T> Inner<T>
-where
-    T: Store,
-{
-    /*
-     * The following methods are used by primary
-     */
-    async fn gen_forward_task<R>(
-        &self,
-        request: &R,
-    ) -> FuturesUnordered<impl Future<Output = Result<()>>>
-    where
-        R: KvRequest + Clone,
-    {
+        let mut tasks = FuturesUnordered::new();
         // 1. Locate the peer servers
-        let peers = self.get_target_addrs(request).await;
+        let peers = self.get_target_addrs(request.key());
         // 2. Send request to peers
-        let tasks = FuturesUnordered::new();
         for peer in peers.into_iter().skip(1) {
             let request = request.clone();
             tasks.push(async move {
@@ -171,34 +240,51 @@ where
                 )))
             });
         }
-        tasks
+        for res in tasks.next().await {
+            res?
+        }
+        Ok(())
     }
 
     /*
      * Helper methods
      */
-    async fn get_target_map(&self) -> TargetMap {
-        self.monitor_client.get_local_target_map().await
+
+    fn local_addr(&self) -> SocketAddr {
+        NetLocalHandle::current().local_addr()
     }
 
-    async fn get_pg_map(&self) -> PgMap {
-        self.monitor_client.get_local_pg_map().await
+    fn is_primary(&self, key: &str) -> bool {
+        let target_addrs = self.get_target_addrs(key);
+        self.local_addr() == target_addrs[0]
     }
 
-    async fn assign_pgid<R>(&self, args: &R) -> PgId
-    where
-        R: KvRequest,
-    {
-        self.distributor.assign_pgid(args.key().as_bytes())
+    fn is_secondary(&self, key: &str) -> bool {
+        let target_addrs = self.get_target_addrs(key);
+        target_addrs
+            .iter()
+            .skip(1)
+            .find(|addr| **addr == self.local_addr())
+            .is_some()
     }
 
-    async fn get_target_addrs<R>(&self, args: &R) -> [SocketAddr; REPLICA_SIZE]
-    where
-        R: KvRequest,
-    {
-        let pgid = self.assign_pgid(args).await;
-        self.distributor.locate(pgid, &self.get_target_map().await)
+    fn get_target_map(&self) -> TargetMap {
+        self.monitor_client.get_local_target_map()
     }
+
+    fn get_target_addrs(&self, key: &str) -> [SocketAddr; REPLICA_SIZE] {
+        let pgid = self.distributor.assign_pgid(key.as_bytes());
+        self.distributor.locate(pgid, &self.get_target_map())
+    }
+}
+
+impl<T> Inner<T>
+where
+    T: Store,
+{
+    /*
+     * Helper methods
+     */
 
     fn put(&mut self, key: String, value: String) {
         let pgid = self.distributor.assign_pgid(key.as_bytes());

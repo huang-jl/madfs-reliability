@@ -11,6 +11,7 @@ pub trait Distributor<const REPLICA_SIZE: usize>: Send + Sync {
     fn locate(&self, pgid: PgId, target_map: &TargetMap) -> [SocketAddr; REPLICA_SIZE];
 }
 
+#[derive(Debug)]
 pub struct SimpleHashDistributor<const N: usize>;
 
 impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {

@@ -32,7 +32,6 @@ pub type PgVersion = u64;
 #[derive(Debug)]
 struct Inner {
     target_map: BTreeMap<TargetMapVersion, TargetMap>,
-    pg_map: BTreeMap<PgMapVersion, PgMap>,
     heartbeat: Vec<Instant>,
 }
 
@@ -40,12 +39,6 @@ struct Inner {
 pub struct TargetMap {
     version: TargetMapVersion,
     pub map: Vec<TargetInfo>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PgMap {
-    version: PgMapVersion,
-    pub map: Vec<PgInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -71,19 +64,6 @@ pub enum TargetState {
     DownOut,
 }
 
-#[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct PgInfo {
-    version: PgVersion,
-    state: PgState,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub enum PgState {
-    Active,   // Everything is alright
-    Inactive, // The cluster jusr start
-    Unclean,  // Recovery is happening
-    Stale,    // All nodes is down
-}
 
 #[madsim::service]
 impl Monitor {
@@ -100,12 +80,6 @@ impl Monitor {
     async fn get_target_map(&self, request: FetchTargetMapReq) -> Result<TargetMap> {
         let inner = self.inner.lock().unwrap();
         inner.get_target_map(request.0)
-    }
-
-    #[rpc]
-    async fn get_pg_map(&self, request: FetchPgMapReq) -> Result<PgMap> {
-        let inner = self.inner.lock().unwrap();
-        inner.get_pg_map(request.0)
     }
 
     #[rpc]
@@ -139,9 +113,6 @@ impl Inner {
             target_map: [(0, TargetMap::empty()), (1, TargetMap::init(server_addrs))]
                 .into_iter()
                 .collect(),
-            pg_map: [(0, PgMap::empty()), (1, PgMap::init(pg_num))]
-                .into_iter()
-                .collect(),
         }
     }
 
@@ -157,18 +128,6 @@ impl Inner {
         }
     }
 
-    fn get_pg_map(&self, version: Option<PgMapVersion>) -> Result<PgMap> {
-        match version {
-            Some(version) => self
-                .pg_map
-                .get(&version)
-                .map_or(Err(Error::VersionDoesNotExist(version)), |map| {
-                    Ok(map.clone())
-                }),
-            None => Ok(self.pg_map.values().next_back().unwrap().clone()),
-        }
-    }
-
     fn heartbeat(&mut self, request: HeartBeat) -> HeartBeatRes {
         let target_id = request.target_info.id as usize;
         assert!(target_id < self.heartbeat.len());
@@ -176,24 +135,16 @@ impl Inner {
 
         // Piggy back updated map
         let mut res = HeartBeatRes {
-            pg_map: None,
             target_map: None,
         };
         if request.target_map_version < self.get_lastest_target_map_version() {
             res.target_map = Some(self.get_target_map(None).unwrap());
-        }
-        if request.pg_map_version < self.get_lastest_pg_map_version() {
-            res.pg_map = Some(self.get_pg_map(None).unwrap());
         }
         res
     }
 
     fn get_lastest_target_map_version(&self) -> TargetMapVersion {
         *self.target_map.keys().next_back().unwrap()
-    }
-
-    fn get_lastest_pg_map_version(&self) -> PgMapVersion {
-        *self.pg_map.keys().next_back().unwrap()
     }
 
     fn check_heartbeat(&mut self) {
@@ -261,35 +212,6 @@ impl TargetMap {
 
     pub fn len(&self) -> usize {
         self.map.len()
-    }
-}
-
-impl PgMap {
-    /// Used for placeholder
-    pub fn empty() -> Self {
-        PgMap {
-            version: 0,
-            map: Vec::new(),
-        }
-    }
-
-    /// The first valid PgMap
-    pub fn init(pg_num: usize) -> Self {
-        let map = (0..pg_num)
-            .map(|_| PgInfo {
-                state: PgState::Inactive,
-                version: 0,
-            })
-            .collect();
-        PgMap { version: 1, map }
-    }
-
-    pub fn pg_num(&self) -> usize {
-        self.map.len()
-    }
-
-    pub fn get_version(&self) -> PgMapVersion {
-        self.version
     }
 }
 

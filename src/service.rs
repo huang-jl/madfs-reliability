@@ -1,9 +1,7 @@
 use crate::PgId;
 use log::info;
-use madsim::net::rpc::{Request as Req, Serialize};
-use madsim::Request;
+use madsim::net::rpc::Serialize;
 use serde::Deserialize;
-use std::collections::btree_map::Range;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
@@ -13,6 +11,8 @@ pub trait Store {
     fn get(&self, key: &str) -> Option<String>;
     fn get_pg_data(&self, pgid: PgId) -> Vec<u8>;
     fn push_pg_data(&mut self, pgid: PgId, data: Vec<u8>);
+
+    fn get_key_version(&self, key: &str) -> Option<u64>;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +68,10 @@ impl Store for KvService {
         //2. push the pg data into kv
         let mut pg_data: BTreeMap<String, Value> = bincode::deserialize(&data).unwrap();
         self.kv.append(&mut pg_data);
+    }
+
+    fn get_key_version(&self, key: &str) -> Option<u64> {
+        self.kv.get(key).map(|value| value.version)
     }
 }
 

@@ -1,4 +1,4 @@
-use crate::{Result, monitor::*};
+use crate::{PgId, Result, monitor::*};
 use madsim::{net::rpc::Request, Request};
 use serde::{Deserialize, Serialize};
 
@@ -52,19 +52,17 @@ impl KvRequest for Put {
 pub struct FetchTargetMapReq(pub Option<TargetMapVersion>);
 
 #[derive(Debug, Serialize, Deserialize, Request)]
-#[rtype("Result<PgMap>")]
-pub struct FetchPgMapReq(pub Option<PgMapVersion>);
-
-#[derive(Debug, Serialize, Deserialize, Request)]
 #[rtype("HeartBeatRes")]
 pub struct HeartBeat {
     pub target_map_version: TargetMapVersion,
-    pub pg_map_version: PgMapVersion,
     pub target_info: TargetInfo,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeartBeatRes {
     pub target_map: Option<TargetMap>,
-    pub pg_map: Option<PgMap>,
 }
+
+#[derive(Debug, Serialize, Deserialize, Request)]
+#[rtype("Result<Vec<u8>>")]
+pub struct Recover(pub PgId);

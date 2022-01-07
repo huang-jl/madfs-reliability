@@ -35,7 +35,7 @@ async fn monitor_simple_test() {
     let monitor_target_map = monitor.inner.lock().unwrap().get_target_map(None).unwrap();
     for server_client in server_clients.iter() {
         let target_map = server_client.fetch_target_map(None).await.unwrap();
-        let local_target_map = server_client.get_local_target_map().await;
+        let local_target_map = server_client.get_local_target_map();
         for ((info, local_info), monitor_info) in target_map
             .map
             .iter()

@@ -1,25 +1,34 @@
-use super::{PgMap, TargetInfo, TargetMap, TargetMapVersion, TargetState};
+use super::{TargetInfo, TargetMap, TargetMapVersion, TargetState};
 use crate::{constant::*, rpc::*, Error, Result};
-use futures::lock::Mutex;
+use futures::Future;
 use madsim::{net::NetLocalHandle, task, time::sleep};
-use std::{net::SocketAddr, sync::Arc};
+use std::{
+    net::SocketAddr,
+    sync::Arc,
+    task::{Poll, Waker},
+};
 
+#[derive(Debug)]
 /// Monitor client used for server
 pub struct ServerClient {
     id: u64,
     /// Address of monitor
     addr: SocketAddr,
     // Use async locks here in case of dead lock
-    target_map: Mutex<TargetMap>,
-    pg_map: Mutex<PgMap>,
+    target_map: std::sync::Mutex<TargetMap>,
+    watch: std::sync::Mutex<Option<Waker>>,
 }
 
 /// Monitor client used for client
 pub struct Client {
     addr: SocketAddr,
     // Use async locks here in case of dead lock
-    target_map: Mutex<TargetMap>,
-    pg_map: Mutex<PgMap>,
+    target_map: std::sync::Mutex<TargetMap>,
+}
+
+pub struct WatchForTargetMap {
+    client: Arc<ServerClient>,
+    prev_version: u64,
 }
 
 impl ServerClient {
@@ -29,7 +38,6 @@ impl ServerClient {
         let net = NetLocalHandle::current();
         let heartbeat = HeartBeat {
             target_map_version: 0,
-            pg_map_version: 0,
             target_info: TargetInfo {
                 id,
                 state: TargetState::UpIn(net.local_addr()),
@@ -40,8 +48,8 @@ impl ServerClient {
         let client = Arc::new(ServerClient {
             id,
             addr,
-            target_map: Mutex::new(response.target_map.unwrap()),
-            pg_map: Mutex::new(response.pg_map.unwrap()),
+            target_map: std::sync::Mutex::new(response.target_map.unwrap()),
+            watch: std::sync::Mutex::new(None),
         });
         // background task: send Heartbeat to monitor
         task::spawn(client.clone().heartbeat()).detach();
@@ -54,12 +62,25 @@ impl ServerClient {
         loop {
             sleep(HEARTBEAT_PERIOD).await;
             let request = HeartBeat {
-                pg_map_version: self.pg_map.lock().await.get_version(),
-                target_map_version: self.target_map.lock().await.get_version(),
+                target_map_version: self.target_map.lock().unwrap().get_version(),
                 target_info: self.local_target_info(),
             };
-            if let Err(err) = net.call(self.addr, request).await {
-                panic!("Error occur at server heartbeat with monitor: {:?}", err);
+            match net.call(self.addr, request).await {
+                Ok(HeartBeatRes {
+                    target_map: Some(updated_map),
+                }) => {
+                    // check if the piggy-backed map is more up-to-date
+                    let mut local_map = self.target_map.lock().unwrap();
+                    if local_map.get_version() < updated_map.get_version() {
+                        *local_map = updated_map;
+                        // call waker to wake up the task
+                        if let Some(waker) = self.watch.lock().unwrap().take() {
+                            waker.wake();
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(err) => panic!("Error occur at server heartbeat with monitor: {:?}", err),
             }
         }
     }
@@ -71,12 +92,8 @@ impl ServerClient {
         }
     }
 
-    pub async fn get_local_target_map(&self) -> TargetMap {
-        self.target_map.lock().await.clone()
-    }
-
-    pub async fn get_local_pg_map(&self) -> PgMap {
-        self.pg_map.lock().await.clone()
+    pub fn get_local_target_map(&self) -> TargetMap {
+        self.target_map.lock().unwrap().clone()
     }
 
     pub async fn fetch_target_map(&self, version: Option<TargetMapVersion>) -> Option<TargetMap> {
@@ -93,28 +110,19 @@ impl ServerClient {
         }
     }
 
-    pub async fn fetch_pg_map(&self, version: Option<TargetMapVersion>) -> Option<PgMap> {
-        let net = NetLocalHandle::current();
-        match net.call(self.addr, FetchPgMapReq(version)).await {
-            Ok(Ok(map)) => Some(map),
-            Ok(Err(err)) => {
-                assert!(matches!(err, Error::VersionDoesNotExist(..)));
-                None
-            }
-            Err(err) => {
-                panic!("Error occur at server fetch from monitor: {:?}", err);
-            }
-        }
-    }
-
     pub async fn update_target_map(&self) {
-        let mut map = self.target_map.lock().await;
-        *map = self.fetch_target_map(None).await.unwrap();
+        let lastest_map = self.fetch_target_map(None).await.unwrap();
+        *self.target_map.lock().unwrap() = lastest_map;
     }
 
-    pub async fn update_pg_map(&self) {
-        let mut map = self.pg_map.lock().await;
-        *map = self.fetch_pg_map(None).await.unwrap();
+    /// This functions can only be called once until the returned future is consumed.
+    /// 
+    /// Multiple [WatchForTargetMap](self::WatchForTargetMap) futures will be forgeted to wakeup (except for the last one).
+    pub async fn watch_for_target_map(self: &Arc<Self>) -> WatchForTargetMap {
+        WatchForTargetMap {
+            client: self.clone(),
+            prev_version: self.get_local_target_map().get_version()
+        }
     }
 }
 
@@ -125,23 +133,16 @@ impl Client {
         let net = NetLocalHandle::current();
         let request = FetchTargetMapReq(None);
         let target_map = net.call(addr, request).await?.unwrap();
-        let request = FetchPgMapReq(None);
-        let pg_map = net.call(addr, request).await?.unwrap();
 
         let client = Arc::new(Client {
             addr,
-            target_map: Mutex::new(target_map),
-            pg_map: Mutex::new(pg_map),
+            target_map: std::sync::Mutex::new(target_map),
         });
         Ok(client)
     }
 
     pub async fn get_local_target_map(&self) -> TargetMap {
-        self.target_map.lock().await.clone()
-    }
-
-    pub async fn get_local_pg_map(&self) -> PgMap {
-        self.pg_map.lock().await.clone()
+        self.target_map.lock().unwrap().clone()
     }
 
     pub async fn fetch_target_map(&self, version: Option<TargetMapVersion>) -> Option<TargetMap> {
@@ -158,27 +159,24 @@ impl Client {
         }
     }
 
-    pub async fn fetch_pg_map(&self, version: Option<TargetMapVersion>) -> Option<PgMap> {
-        let net = NetLocalHandle::current();
-        match net.call(self.addr, FetchPgMapReq(version)).await {
-            Ok(Ok(map)) => Some(map),
-            Ok(Err(err)) => {
-                assert!(matches!(err, Error::VersionDoesNotExist(..)));
-                None
-            }
-            Err(err) => {
-                panic!("Error occur at server fetch from monitor: {:?}", err);
-            }
-        }
-    }
-
     pub async fn update_target_map(&self) {
-        let mut map = self.target_map.lock().await;
-        *map = self.fetch_target_map(None).await.unwrap();
+        let lastest_map = self.fetch_target_map(None).await.unwrap();
+        *self.target_map.lock().unwrap() = lastest_map;
     }
+}
 
-    pub async fn update_pg_map(&self) {
-        let mut map = self.pg_map.lock().await;
-        *map = self.fetch_pg_map(None).await.unwrap();
+impl Future for WatchForTargetMap {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        if self.prev_version < self.client.get_local_target_map().get_version() {
+            Poll::Ready(())
+        } else {
+            *self.client.watch.lock().unwrap() = Some(cx.waker().clone());
+            Poll::Pending
+        }
     }
 }

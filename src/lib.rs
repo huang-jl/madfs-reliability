@@ -1,8 +1,4 @@
-use std::ops::Deref;
-
-// use madsim::net::rpc::{Request, hash_str};
-use madsim::Request;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 pub mod ctl;
@@ -29,6 +25,9 @@ mod constant {
     pub const OUT_TIMEOUT: Duration = Duration::from_millis(20_000);
 
     pub const HEARTBEAT_PERIOD: Duration = Duration::from_millis(3000);
+
+    pub const RECOVER_TIMEOUT: Duration = Duration::from_millis(5000);
+    pub const RECOVER_RETRY: u32 = 3;
 }
 
 pub type PgId = usize;
