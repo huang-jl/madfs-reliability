@@ -1,15 +1,13 @@
-use crate::monitor::{PgMap, TargetMap};
+use crate::constant::PG_NUM;
+use crate::{monitor::TargetMap, PgId};
 use ahash::AHasher;
 use std::{
     hash::{Hash, Hasher},
     net::SocketAddr,
-    str::FromStr,
 };
 
-pub type PgId = usize;
-
 pub trait Distributor<const REPLICA_SIZE: usize>: Send + Sync {
-    fn assign_pgid(&self, key: &[u8], pg_map: &PgMap) -> PgId;
+    fn assign_pgid(&self, key: &[u8]) -> PgId;
     fn locate(&self, pgid: PgId, target_map: &TargetMap) -> [SocketAddr; REPLICA_SIZE];
 }
 
@@ -48,18 +46,17 @@ impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {
             .unwrap()
     }
 
-    fn assign_pgid(&self, key: &[u8], pg_map: &PgMap) -> PgId {
+    fn assign_pgid(&self, key: &[u8]) -> PgId {
+        assert_eq!(PG_NUM & (PG_NUM - 1), 0);
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
-        let pg_num = pg_map.pg_num();
-        assert_eq!(pg_num & (pg_num - 1), 0);
-        hasher.finish() as usize & pg_num
+        hasher.finish() as usize & (PG_NUM - 1)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::constant::REPLICA_SIZE;
+    use crate::constant::{PG_NUM, REPLICA_SIZE};
     use crate::distributor::{Distributor, SimpleHashDistributor};
     use crate::monitor::{TargetInfo, TargetMap, TargetState};
     use crate::test::common::*;
@@ -86,7 +83,6 @@ mod test {
 
     #[test]
     fn correct_location() {
-        const PG_NUM: usize = 256;
         let (target_map, distributor) = init(100, true);
 
         for pgid in 0..PG_NUM {

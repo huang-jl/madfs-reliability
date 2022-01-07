@@ -3,7 +3,7 @@ use crate::{
     distributor::{Distributor, SimpleHashDistributor},
     monitor::{client::ServerClient, PgMap, TargetMap},
     service::{Service, ServiceInput},
-    ForwardReq,
+    ForwardReq, PgId,
 };
 use futures::{lock::Mutex, stream::FuturesUnordered, Future, StreamExt};
 use log::info;
@@ -73,11 +73,10 @@ where
                 Err(ServerError::NotPrimary)
             }
         } else {
-            if self.is_primary(&request).await || self.is_secondary(&request).await
-            {
-                Err(ServerError::WrongTarget)
-            } else {
+            if self.is_primary(&request).await || self.is_secondary(&request).await {
                 Ok(self.inner.lock().await.service.dispatch_read(request))
+            } else {
+                Err(ServerError::WrongTarget)
             }
         }
     }
@@ -148,7 +147,7 @@ where
         let peers = self.get_target_addrs(args).await;
         // 2. Send request to peers
         let tasks = FuturesUnordered::new();
-        for peer in peers {
+        for peer in peers.into_iter().skip(1) {
             let args = args.clone();
             tasks.push(async move {
                 let net = NetLocalHandle::current();
@@ -189,10 +188,12 @@ where
         self.monitor_client.get_local_pg_map().await
     }
 
+    async fn assign_pgid(&self, args: &T::Input) -> PgId {
+        self.distributor.assign_pgid(args.key_bytes())
+    }
+
     async fn get_target_addrs(&self, args: &T::Input) -> [SocketAddr; REPLICA_SIZE] {
-        let pgid = self
-            .distributor
-            .assign_pgid(args.key_bytes(), &self.get_pg_map().await);
+        let pgid = self.assign_pgid(args).await;
         self.distributor.locate(pgid, &self.get_target_map().await)
     }
 }

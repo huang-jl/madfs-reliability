@@ -7,7 +7,7 @@ use crate::{
         Monitor,
     },
     service::{KvArgs, KvRes, KvService, ServiceInput},
-    Error,
+    Error, PgId,
 };
 use log::*;
 use madsim::{net::NetLocalHandle, Handle, LocalHandle};
@@ -113,9 +113,8 @@ impl Client {
     }
 
     pub async fn get_target_addrs(&self, request: &KvArgs) -> [SocketAddr; REPLICA_SIZE] {
-        let pg_map = self.monitor_client.get_local_pg_map().await;
+        let pgid = self.distributor.assign_pgid(request.key_bytes());
         let target_map = self.monitor_client.get_local_target_map().await;
-        let pgid = self.distributor.assign_pgid(request.key_bytes(), &pg_map);
         self.distributor.locate(pgid, &target_map)
     }
 
@@ -126,6 +125,7 @@ impl Client {
         retry: Option<u32>,
     ) -> Result<KvRes, Error> {
         const TIMEOUT: Duration = Duration::from_millis(10_000);
+        // Add pgid prefix to the requesting key
         self.handle
             .spawn(async move {
                 let net = NetLocalHandle::current();

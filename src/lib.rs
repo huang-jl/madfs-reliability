@@ -18,6 +18,7 @@ mod constant {
 
     pub const REPLICA_SIZE: usize = 3;
     pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
+    pub const PG_NUM: usize = 256;
 
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(2000);
     pub const FORWARD_RETRY: u32 = 3;
@@ -28,6 +29,9 @@ mod constant {
 
     pub const HEARTBEAT_PERIOD: Duration = Duration::from_millis(3000);
 }
+
+
+pub type PgId = usize;
 
 #[derive(Error, Debug)]
 pub enum Error {
