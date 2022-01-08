@@ -1,6 +1,7 @@
 use super::{TargetInfo, TargetMap, TargetMapVersion, TargetState};
 use crate::{constant::*, rpc::*, Error, Result};
 use futures::Future;
+use log::info;
 use madsim::{net::NetLocalHandle, task, time::sleep};
 use std::{
     net::SocketAddr,
@@ -111,17 +112,27 @@ impl ServerClient {
     }
 
     pub async fn update_target_map(&self) {
-        let lastest_map = self.fetch_target_map(None).await.unwrap();
-        *self.target_map.lock().unwrap() = lastest_map;
+        let updated_map = self.fetch_target_map(None).await.unwrap();
+        let mut local_map = self.target_map.lock().unwrap();
+        if local_map.get_version() < updated_map.get_version() {
+            *local_map = updated_map;
+            // call waker to wake up the task
+            if let Some(waker) = self.watch.lock().unwrap().take() {
+                waker.wake();
+            }
+        }
     }
 
     /// This functions can only be called once until the returned future is consumed.
-    /// 
+    ///
     /// Multiple [WatchForTargetMap](self::WatchForTargetMap) futures will be forgeted to wakeup (except for the last one).
-    pub async fn watch_for_target_map(self: &Arc<Self>) -> WatchForTargetMap {
+    pub fn watch_for_target_map(
+        self: &Arc<Self>,
+        version: Option<TargetMapVersion>,
+    ) -> WatchForTargetMap {
         WatchForTargetMap {
             client: self.clone(),
-            prev_version: self.get_local_target_map().get_version()
+            prev_version: version.unwrap_or(self.get_local_target_map().get_version()),
         }
     }
 }

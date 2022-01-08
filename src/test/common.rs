@@ -10,18 +10,28 @@ use crate::{
     service::KvService,
     Error, Result,
 };
+use lazy_static::lazy_static;
 use log::*;
 use madsim::{
     net::{rpc::Request, NetLocalHandle},
     Handle, LocalHandle,
 };
-use rand::{thread_rng, Rng};
+use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{
     io::{self, ErrorKind},
     net::SocketAddr,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
+
+lazy_static! {
+    static ref RNG: Mutex<StdRng> = Mutex::new(StdRng::seed_from_u64(
+        std::env::var("SEED")
+            .unwrap_or("2017010191".to_owned())
+            .parse()
+            .unwrap(),
+    ));
+}
 
 #[derive(thiserror::Error, Debug)]
 enum ClientError {
@@ -32,7 +42,7 @@ enum ClientError {
 pub struct KvServerCluster {
     servers: Vec<ReliableCtl<KvService>>,
     addrs: Vec<SocketAddr>,
-    handles: Vec<LocalHandle>,
+    handle: Handle,
 }
 
 pub struct ClientId(u64);
@@ -44,7 +54,7 @@ pub struct Client {
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
 }
 
-pub fn gen_random_put(key_len: usize, val_len: usize) -> (String, String) {
+pub fn gen_random_put(key_len: usize, val_len: usize) -> (String, Vec<u8>) {
     let mut chartset = Vec::new();
     for i in 'A'..'Z' {
         chartset.push(i);
@@ -52,17 +62,15 @@ pub fn gen_random_put(key_len: usize, val_len: usize) -> (String, String) {
     for i in 'a'..'z' {
         chartset.push(i);
     }
-
-    let mut rng = thread_rng();
-    let mut gen_random = |length: usize| -> String {
+    let gen_random = |length: usize| -> String {
         (0..length)
             .map(|_| {
-                let idx = rng.gen_range(0..chartset.len());
+                let idx = RNG.lock().unwrap().gen_range(0..chartset.len());
                 chartset[idx]
             })
             .collect()
     };
-    (gen_random(key_len), gen_random(val_len))
+    (gen_random(key_len), gen_random(val_len).into_bytes())
 }
 
 /// - `pg_num` - total number of placement group
@@ -108,11 +116,7 @@ impl Client {
         client
     }
 
-    pub async fn send<T>(
-        &self,
-        request: T,
-        retry: Option<u32>,
-    ) -> Result<<T as Request>::Response>
+    pub async fn send<T>(&self, request: T, retry: Option<u32>) -> Result<<T as Request>::Response>
     where
         T: KvRequest + Clone,
     {
@@ -120,8 +124,7 @@ impl Client {
         self.send_to(request, targets[0], retry).await
     }
 
-    pub async fn get_target_addrs(&self, key: &[u8]) -> [SocketAddr; REPLICA_SIZE]
-    {
+    pub async fn get_target_addrs(&self, key: &[u8]) -> [SocketAddr; REPLICA_SIZE] {
         let pgid = self.distributor.assign_pgid(key);
         let target_map = self.monitor_client.get_local_target_map().await;
         self.distributor.locate(pgid, &target_map)
@@ -171,18 +174,15 @@ impl KvServerCluster {
         let addrs = (0..server_num)
             .map(|id| SocketAddr::from(([0, 0, 1, id as u8], 0)))
             .collect::<Vec<_>>();
-        let handles: Vec<_> = addrs
-            .iter()
-            .map(|addr| {
-                let local_handle = handle.create_host(addr).unwrap();
-                handle.net.connect(addr.clone());
-                local_handle
-            })
-            .collect();
+        addrs.iter().for_each(|addr| {
+            handle.create_host(addr).unwrap();
+            handle.net.connect(addr.clone());
+        });
         let mut servers = Vec::new();
         for id in 0..server_num {
+            let local_handle = handle.get_host(addrs[id]).unwrap();
             servers.push(
-                handles[id]
+                local_handle
                     .spawn(async move {
                         ReliableCtl::new(
                             KvService::new(),
@@ -195,11 +195,23 @@ impl KvServerCluster {
         KvServerCluster {
             servers,
             addrs,
-            handles,
+            handle,
         }
     }
 
     pub fn get_addrs(&self) -> Vec<SocketAddr> {
         self.addrs.clone()
+    }
+
+    pub fn crash(&self, idx: usize) {
+        self.handle.kill(self.addrs[idx]);
+    }
+
+    pub fn disconnect(&self, idx: usize) {
+        self.handle.net.disconnect(self.addrs[idx]);
+    }
+
+    pub fn connect(&self, idx: usize) {
+        self.handle.net.connect(self.addrs[idx]);
     }
 }

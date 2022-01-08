@@ -28,9 +28,14 @@ mod constant {
 
     pub const RECOVER_TIMEOUT: Duration = Duration::from_millis(5000);
     pub const RECOVER_RETRY: u32 = 3;
+
+    pub const CONSULT_TIMEOUT: Duration = Duration::from_millis(2000);
 }
 
 pub type PgId = usize;
+pub type TargetMapVersion = u64;
+pub type PgMapVersion = u64;
+pub type PgVersion = u64;
 
 #[derive(Error, Debug, Serialize, Deserialize)]
 pub enum Error {
@@ -42,6 +47,8 @@ pub enum Error {
     NetworkError(String),
     #[error("Version {0} does not exist in monitor")]
     VersionDoesNotExist(u64),
+    #[error("Corresponding pg is recovering, should request it later")]
+    PgIsRecovering,
 }
 
 impl From<std::io::Error> for Error {

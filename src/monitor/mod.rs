@@ -1,4 +1,4 @@
-use crate::{constant::*, rpc::*, Error, Result};
+use crate::{constant::*, rpc::*, Error, Result, TargetMapVersion};
 use log::{info, warn};
 use madsim::{
     task,
@@ -24,10 +24,6 @@ mod test;
 pub struct Monitor {
     inner: Arc<Mutex<Inner>>,
 }
-
-pub type TargetMapVersion = u64;
-pub type PgMapVersion = u64;
-pub type PgVersion = u64;
 
 #[derive(Debug)]
 struct Inner {
@@ -199,7 +195,7 @@ impl TargetMap {
                 state: TargetState::UpIn(addr),
             })
             .collect();
-        TargetMap { version: 0, map }
+        TargetMap { version: 1, map }
     }
 
     pub fn is_active(&self, target_id: usize) -> bool {

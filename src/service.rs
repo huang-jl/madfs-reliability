@@ -2,13 +2,14 @@ use crate::PgId;
 use log::info;
 use madsim::net::rpc::Serialize;
 use serde::Deserialize;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
 /// What we need is a key/value Store
 pub trait Store {
-    fn put(&mut self, key: String, value: String);
-    fn get(&self, key: &str) -> Option<String>;
+    fn put(&mut self, key: String, value: Vec<u8>);
+    fn get(&self, key: &str) -> Option<Vec<u8>>;
     fn get_pg_data(&self, pgid: PgId) -> Vec<u8>;
     fn push_pg_data(&mut self, pgid: PgId, data: Vec<u8>);
 
@@ -17,7 +18,7 @@ pub trait Store {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Value {
-    data: String,
+    data: Vec<u8>,
     version: u64, //version of this key
 }
 
@@ -26,18 +27,27 @@ pub struct KvService {
 }
 
 impl Store for KvService {
-    fn put(&mut self, key: String, value: String) {
-        info!("Put key: {}, value: {}", key, value);
-        let entry = self.kv.entry(key).or_insert(Value {
-            data: value,
-            version: 0,
-        });
-        entry.version += 1;
+    fn put(&mut self, key: String, data: Vec<u8>) {
+        info!("Put key: {:?}", key);
+        self.kv
+            .entry(key)
+            .and_modify(|value| {
+                value.data = data.clone();
+                value.version += 1;
+            })
+            .or_insert(Value { data, version: 0 });
     }
 
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Option<Vec<u8>> {
         let res = self.kv.get(key).cloned().map(|v| v.data);
-        info!("Get key: {}, return: {:?}", key, res);
+        info!(
+            "Get key: {:?}, {}",
+            key,
+            match &res {
+                Some(_) => "Get the value",
+                None => "value does not exist",
+            }
+        );
         res
     }
 
@@ -98,9 +108,9 @@ mod test {
     fn test_pgid() {
         let mut service = KvService::new();
         let distributor = SimpleHashDistributor::<REPLICA_SIZE>;
-        let mut golden: Vec<BTreeMap<String, String>> = vec![BTreeMap::new(); PG_NUM];
+        let mut golden: Vec<BTreeMap<String, Vec<u8>>> = vec![BTreeMap::new(); PG_NUM];
         for _ in 0..5000 {
-            let (k, v) = gen_random_put(5, 10);
+            let (k, v) = gen_random_put(3, 10);
             let pgid = distributor.assign_pgid(k.as_bytes());
             service.put(format!("{}.{}", pgid, k), v.clone());
             golden[pgid].insert(format!("{}.{}", pgid, k), v);
