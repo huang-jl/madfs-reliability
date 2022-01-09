@@ -45,13 +45,25 @@ pub struct KvServerCluster {
     handle: Handle,
 }
 
+#[derive(Debug, Clone, Copy)]
 pub struct ClientId(u64);
 
 pub struct Client {
     id: ClientId,
     handle: LocalHandle,
-    monitor_client: Arc<MonitorClient>,
+    pub monitor_client: Arc<MonitorClient>,
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
+}
+
+impl Clone for Client {
+    fn clone(&self) -> Self {
+        Self {
+            id: self.id.clone(),
+            handle: self.handle.clone(),
+            monitor_client: self.monitor_client.clone(),
+            distributor: Box::new(SimpleHashDistributor::<REPLICA_SIZE>),
+        }
+    }
 }
 
 pub fn gen_random_put(key_len: usize, val_len: usize) -> (String, Vec<u8>) {

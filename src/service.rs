@@ -28,7 +28,6 @@ pub struct KvService {
 
 impl Store for KvService {
     fn put(&mut self, key: String, data: Vec<u8>) {
-        info!("Put key: {:?}", key);
         self.kv
             .entry(key)
             .and_modify(|value| {
@@ -39,16 +38,7 @@ impl Store for KvService {
     }
 
     fn get(&self, key: &str) -> Option<Vec<u8>> {
-        let res = self.kv.get(key).cloned().map(|v| v.data);
-        info!(
-            "Get key: {:?}, {}",
-            key,
-            match &res {
-                Some(_) => "Get the value",
-                None => "value does not exist",
-            }
-        );
-        res
+        self.kv.get(key).cloned().map(|v| v.data)
     }
 
     /// Will return the bytes representation of a BtreeMap

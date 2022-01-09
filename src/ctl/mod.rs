@@ -1,3 +1,4 @@
+use self::heal::HealJob;
 use crate::{
     constant::*,
     distributor::{Distributor, SimpleHashDistributor},
@@ -7,6 +8,7 @@ use crate::{
     Error, PgId, PgVersion, Result,
 };
 use futures::{
+    channel::mpsc,
     lock::Mutex,
     stream::{FuturesOrdered, FuturesUnordered},
     StreamExt,
@@ -16,12 +18,17 @@ use madsim::{net::NetLocalHandle, task, time::sleep};
 use serde::{Deserialize, Serialize};
 use std::{fmt::Debug, io, net::SocketAddr, sync::Arc, time::Duration};
 
+mod heal;
+mod peer;
+mod recover;
+
 /// Reliable wrapper of service
 /// PG information is stored in `inner.service` K/V
 pub struct ReliableCtl<T> {
     inner: Arc<Mutex<Inner<T>>>,
     monitor_client: Arc<ServerClient>,
     distributor: Arc<dyn Distributor<REPLICA_SIZE>>,
+    heal_tx: mpsc::UnboundedSender<HealJob>,
 }
 
 // The #[derive(Clone)] bindly bind T: Clone, but we do not need it.
@@ -35,6 +42,7 @@ where
             inner: self.inner.clone(),
             monitor_client: self.monitor_client.clone(),
             distributor: self.distributor.clone(),
+            heal_tx: self.heal_tx.clone(),
         }
     }
 }
@@ -46,16 +54,24 @@ struct Inner<T> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PgInfo {
+    /// version = 0 means this pg is not served before,
+    /// since the first `put` will increment version to 1.
     version: PgVersion,
     state: PgState,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PgState {
-    Active,   // Everything is alright
-    Inactive, // This server do not responsible for this PG
-    Unclean,  // Recovery is happening
-    Stale,    // This pg on this server is out of date
+    /// Everything is alright
+    Active,
+    /// This server do not responsible for this PG
+    Inactive,
+    /// Cannot peering with other servers which are responsible for this pg
+    Unprepared,
+    /// Pg is absent (maybe recovering is in progress), needs to be recovered
+    Absent,
+    /// This pg on this server is out of date, some pg on other peers has higher version
+    Stale,
 }
 
 impl PgInfo {
@@ -74,91 +90,39 @@ where
     T: Store + Sync + Send + 'static,
 {
     pub fn new(service: T, monitor_client: Arc<ServerClient>) -> Self {
+        let (heal_tx, heal_rx) = mpsc::unbounded();
         let ctl = ReliableCtl {
             inner: Arc::new(Mutex::new(Inner::new(service))),
             monitor_client,
             distributor: Arc::new(SimpleHashDistributor),
+            heal_tx,
         };
         ctl.add_rpc_handler();
-        ctl.start_background_task();
+        ctl.start_background_task(heal_rx);
         ctl
     }
 
-    /// Checking for all PGs, aims to:
-    /// 1. Find the pgs of responsibility
-    /// 2. Check whether local pg is the most up-to-date
-    /// 3. Update PgInfo
-    async fn peering(&self) {
-        let local_addr = self.local_addr();
-        for pgid in 0..PG_NUM {
-            let target_map = self.get_target_map();
-            let target_addrs = self.distributor.locate(pgid, &target_map);
-            if !target_addrs.iter().any(|addr| *addr == local_addr) {
-                continue;
-            }
-            let tasks = target_addrs
-                .into_iter()
-                .filter(|addr| *addr != local_addr)
-                .map(|addr| {
-                    let request = ConsultPgInfo(pgid);
-                    async move {
-                        let net = NetLocalHandle::current();
-                        net.call_timeout(addr, request, CONSULT_TIMEOUT).await
-                    }
-                })
-                .collect::<FuturesOrdered<_>>();
-            let peer_res: Vec<io::Result<PgInfo>> = tasks.collect().await;
-            let mut inner = self.inner.lock().await;
-            let mut local_pg_info = inner.get_pg_info(pgid);
-            // Scan the results:
-            // 1. log the errors
-            // 2. check if there is a more up-to-date pg on peers
-            if peer_res
-                .iter()
-                .filter(|res| match res {
-                    Err(err) => {
-                        warn!("Error occur when peering: {}", err);
-                        false
-                    }
-                    _ => true,
-                })
-                .map(|res| res.as_ref().unwrap())
-                .any(|res| res.version > local_pg_info.version)
-            {
-                warn!(
-                    "Detect pg {} is stale, local version = {}",
-                    pgid, local_pg_info.version
-                );
-                local_pg_info.state = PgState::Stale;
-                inner.set_pg_info(pgid, local_pg_info);
-            } else if peer_res.iter().all(|res| !matches!(res, Err(_))) {
-                info!(
-                    "Pg {} peer succeed, local version = {}",
-                    pgid, local_pg_info.version
-                );
-                // The pg on this server is the newest and all peers response the Consult Request
-                local_pg_info.state = PgState::Active;
-                inner.set_pg_info(pgid, local_pg_info);
-            } else {
-                // Network error during peering.
-                // Conservatively mark this pg as `Unclean` to prevent it from serving request
-                local_pg_info.state = PgState::Unclean;
-                inner.set_pg_info(pgid, local_pg_info);
-            }
-        }
-    }
-
-    fn start_background_task(&self) {
+    fn start_background_task(&self, mut heal_rx: mpsc::UnboundedReceiver<HealJob>) {
+        // Recovery task
         let this = self.clone();
         task::spawn(async move {
             this.background_recovery().await;
         })
         .detach();
+        // Peering task
         let this = self.clone();
         task::spawn(async move {
             loop {
                 this.peering().await;
                 sleep(Duration::from_millis(5000)).await;
+            }
+        })
+        .detach();
+        // Healing task
+        let this = self.clone();
+        task::spawn(async move {
+            while let Some(job) = heal_rx.next().await {
+                this.heal_for(job).await;
             }
         })
         .detach();
@@ -176,17 +140,11 @@ where
             let target_map = self.get_target_map();
             for pgid in 0..PG_NUM {
                 let target_addrs = self.distributor.locate(pgid, &target_map);
-                if target_addrs
-                    .iter()
-                    .find(|addr| **addr == self.local_addr())
-                    .is_some()
-                {
+                if target_addrs.iter().any(|addr| *addr == self.local_addr()) {
                     let local_info = self.inner.lock().await.get_pg_info(pgid);
                     match local_info.state {
-                        PgState::Active => {
-                            todo!("If the current pg version is lagging, need to recovery [maybe another healing background task]")
-                        }
-                        PgState::Inactive => {
+                        PgState::Active => {}
+                        PgState::Absent | PgState::Inactive => {
                             warn!("Start recovering pg {}", pgid);
                             if let Err(err) = self.recover_for(pgid, target_addrs[0].clone()).await
                             {
@@ -197,66 +155,13 @@ where
                                 continue;
                             }
                         }
-                        PgState::Unclean => {
-                            // Indicates last time the recovery did not succedd
-                            warn!("Start recovering pg {} again: probably last time recovered incorrectly", pgid);
-                            if let Err(err) = self.recover_for(pgid, target_addrs[0].clone()).await
-                            {
-                                error!(
-                                    "Error occur when recovering pg {} from primary {}: {}",
-                                    pgid, target_addrs[0], err
-                                );
-                                continue;
-                            }
-                        }
-                        PgState::Stale => {
-                            todo!("For now we did not cares about stale pgstate here")
+                        PgState::Stale | PgState::Unprepared => {
+                            // For now we did not cares about stale or unprepraed state in recovery
                         }
                     }
                 }
             }
             watch_version = target_map.get_version();
-        }
-    }
-
-    /// For now: asking recovery pg data from primary
-    async fn recover_for(&self, pgid: PgId, primary: SocketAddr) -> Result<()> {
-        // 1. change the state of local pg
-        {
-            let mut inner = self.inner.lock().await;
-            inner.set_pg_state(pgid, PgState::Unclean);
-        }
-        // 2. get whole pg data from primary
-        let net = NetLocalHandle::current();
-        let mut response: Option<RecoverRes> = None;
-        for _ in 0..RECOVER_RETRY {
-            let request = Recover(pgid);
-            match net.call_timeout(primary, request, RECOVER_TIMEOUT).await {
-                Ok(res) => response = Some(res?),
-                Err(err) => {
-                    warn!("Send Recover request get error: {}", err);
-                    continue;
-                }
-            }
-        }
-        // 3. push pg data into local and update pg_info
-        match response {
-            Some(RecoverRes { data, version }) => {
-                let mut inner = self.inner.lock().await;
-                inner.service.push_pg_data(pgid, data);
-                inner.set_pg_info(
-                    pgid,
-                    PgInfo {
-                        state: PgState::Active,
-                        version,
-                    },
-                );
-                Ok(())
-            }
-            None => Err(Error::NetworkError(format!(
-                "Recover still error after retry for {} times",
-                RECOVER_RETRY
-            ))),
         }
     }
 
@@ -273,10 +178,11 @@ where
 
         if self.is_primary(request.key()) {
             self.forward_put_by_primary(request.clone()).await?;
-            Ok(self.inner.lock().await.put(
+            self.inner.lock().await.put(
                 request.key().to_owned(),
                 request.value().unwrap().to_owned(),
-            ))
+            );
+            Ok(())
         } else {
             Err(Error::NotPrimary)
         }
@@ -336,6 +242,7 @@ where
         let mut tasks = FuturesUnordered::new();
         // 1. Locate the peer servers
         let peers = self.get_target_addrs(request.key());
+        info!("Peers = {:?}", peers);
         // 2. Send request to peers
         for peer in peers.into_iter().skip(1) {
             let request = request.clone();
@@ -358,7 +265,7 @@ where
                 )))
             });
         }
-        for res in tasks.next().await {
+        while let Some(res) = tasks.next().await {
             res?
         }
         Ok(())
@@ -395,13 +302,14 @@ where
         self.distributor.locate(pgid, &self.get_target_map())
     }
 
+    /// Check whether this server can serve `pgid`.
     async fn check_pg_state(&self, pgid: PgId) -> Result<()> {
-        let inner = self.inner.lock().await;
-        match inner.get_pg_info(pgid).state {
-            PgState::Active => Ok(()),
+        match self.inner.lock().await.get_pg_info(pgid).state {
+            // TODO: Can stale pg pass checking ?
+            PgState::Active | PgState::Stale => Ok(()),
             PgState::Inactive => Err(Error::WrongTarget),
-            PgState::Unclean => Err(Error::PgIsRecovering),
-            PgState::Stale => todo!(),
+            // Unprepared, Absent
+            x => Err(Error::PgUnavailable(x)),
         }
     }
 }
@@ -422,12 +330,18 @@ where
      */
 
     fn put(&mut self, key: String, value: Vec<u8>) {
+        info!("Put {}", key);
         let pgid = self.distributor.assign_pgid(key.as_bytes());
         self.service.put(format!("{}.{}", pgid, key), value);
-        self.increase_pg_version(pgid);
+        // Increment version
+        self.update_pg_info(pgid, |mut pg_info| {
+            pg_info.version += 1;
+            pg_info
+        });
     }
 
     fn get(&mut self, key: &str) -> Option<Vec<u8>> {
+        info!("Get {}", key);
         let pgid = self.distributor.assign_pgid(key.as_bytes());
         self.service.get(&format!("{}.{}", pgid, key))
     }
@@ -441,20 +355,13 @@ where
             .unwrap_or(PgInfo::new())
     }
 
-    fn set_pg_info(&mut self, pgid: PgId, pg_info: PgInfo) {
+    fn update_pg_info<F>(&mut self, pgid: PgId, f: F)
+    where
+        F: FnOnce(PgInfo) -> PgInfo,
+    {
+        let updated_pg_info = f(self.get_pg_info(pgid));
         let key = format!("pginfo.{}", pgid);
-        self.service.put(key, bincode::serialize(&pg_info).unwrap());
-    }
-
-    fn set_pg_state(&mut self, pgid: PgId, state: PgState) {
-        let mut pg_info = self.get_pg_info(pgid);
-        pg_info.state = state;
-        self.set_pg_info(pgid, pg_info);
-    }
-
-    fn increase_pg_version(&mut self, pgid: PgId) {
-        let mut pg_info = self.get_pg_info(pgid);
-        pg_info.version += 1;
-        self.set_pg_info(pgid, pg_info);
+        self.service
+            .put(key, bincode::serialize(&updated_pg_info).unwrap());
     }
 }

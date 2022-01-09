@@ -1,3 +1,4 @@
+use ctl::PgState;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -17,7 +18,7 @@ mod constant {
     pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
     pub const PG_NUM: usize = 256;
 
-    pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(2000);
+    pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(1000);
     pub const FORWARD_RETRY: u32 = 3;
 
     pub const MONITOR_CHECK_PERIOD: Duration = Duration::from_millis(2000);
@@ -26,10 +27,10 @@ mod constant {
 
     pub const HEARTBEAT_PERIOD: Duration = Duration::from_millis(3000);
 
-    pub const RECOVER_TIMEOUT: Duration = Duration::from_millis(5000);
+    pub const RECOVER_TIMEOUT: Duration = Duration::from_millis(3000);
     pub const RECOVER_RETRY: u32 = 3;
 
-    pub const CONSULT_TIMEOUT: Duration = Duration::from_millis(2000);
+    pub const CONSULT_TIMEOUT: Duration = Duration::from_millis(1000);
 }
 
 pub type PgId = usize;
@@ -47,8 +48,8 @@ pub enum Error {
     NetworkError(String),
     #[error("Version {0} does not exist in monitor")]
     VersionDoesNotExist(u64),
-    #[error("Corresponding pg is recovering, should request it later")]
-    PgIsRecovering,
+    #[error("The pg on corressponding server is unavailable: {0:?}")]
+    PgUnavailable(PgState),
 }
 
 impl From<std::io::Error> for Error {

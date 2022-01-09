@@ -6,6 +6,8 @@ use crate::{
     Error,
 };
 pub use common::{create_monitor, gen_random_put, Client, KvServerCluster};
+use futures::stream::{FuturesUnordered, StreamExt};
+use log::info;
 use madsim::time::sleep;
 use std::{collections::HashMap, time::Duration};
 
@@ -30,7 +32,7 @@ async fn cluster_simple_test() {
         MonitorClient::new(str_to_addr(MONITOR_ADDR)).await.unwrap(),
     );
 
-    // Wait for the cluster to start up
+    // Wait for the cluster to start up (peering)
     sleep(Duration::from_millis(5000)).await;
 
     for _ in 0..100 {
@@ -49,8 +51,8 @@ async fn cluster_simple_test() {
     }
 }
 
+#[madsim::test]
 async fn one_server_crash() {
-    todo!("Test the crash situation");
     const SERVER_NUM: usize = 10;
     const CRASH_TARGET_IDX: usize = 0;
 
@@ -68,6 +70,9 @@ async fn one_server_crash() {
 
     let mut golden = HashMap::new();
 
+    // Wait for the cluster to start up (peering)
+    sleep(Duration::from_millis(5000)).await;
+
     for _ in 0..100 {
         let (key, value) = gen_random_put(10, 20);
         golden.insert(key.clone(), value.clone());
@@ -84,22 +89,36 @@ async fn one_server_crash() {
             .get_target_addrs(key.as_bytes())
             .await
             .iter()
-            .find(|addr| **addr == crash_addr)
-            .is_some()
+            .any(|addr| *addr == crash_addr)
         {
             keys.push(key.clone());
         }
     }
     // Server 0 is crashed
     cluster.crash(CRASH_TARGET_IDX);
+    info!("Server crash!");
 
-    for key in keys.iter() {
-        let request = Get(key.clone());
-        let res = client.send(request, None).await;
-        assert!(matches!(res, Ok(Err(Error::PgIsRecovering))));
-    }
+    let mut tasks = keys
+        .iter()
+        .map(|key| {
+            let client = client.clone();
+            async move {
+                let (_, value) = gen_random_put(10, 20);
+                let request = Put {
+                    key: key.clone(),
+                    value,
+                };
+                let res = client.send(request, None).await;
+                info!("Send Put after server crash, response : {:?}", res);
+                assert!(matches!(res, Ok(Err(_)) | Err(_)));
+            }
+        })
+        .collect::<FuturesUnordered<_>>();
+    while let Some(_) = tasks.next().await {}
 
+    // wait for monitor marks it OUT
     sleep(Duration::from_millis(20_000)).await;
+    client.monitor_client.update_target_map().await;
 
     for (key, value) in golden.iter() {
         let targets = client.get_target_addrs(key.as_bytes()).await;
