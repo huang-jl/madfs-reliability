@@ -1,8 +1,6 @@
 use crate::PgId;
-use log::info;
 use madsim::net::rpc::Serialize;
 use serde::Deserialize;
-use std::cmp::Ordering;
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
@@ -14,12 +12,17 @@ pub trait Store {
     fn push_pg_data(&mut self, pgid: PgId, data: Vec<u8>);
 
     fn get_key_version(&self, key: &str) -> Option<u64>;
+    /// Get version of all keys in pg `pgid`.
+    /// Return the vector of (key, version) pair inside pg `pgid`.
+    fn get_heal_data(&self, pgid: PgId) -> Vec<(String, u64)>;
+    /// Push the updated (key, value) pair from `data` into pg `pgid`.
+    fn push_heal_data(&mut self, pgid: PgId, data: Vec<(String, Value)>);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Value {
-    data: Vec<u8>,
-    version: u64, //version of this key
+    pub data: Vec<u8>,
+    pub version: u64, //version of this key
 }
 
 pub struct KvService {
@@ -72,6 +75,26 @@ impl Store for KvService {
 
     fn get_key_version(&self, key: &str) -> Option<u64> {
         self.kv.get(key).map(|value| value.version)
+    }
+
+    fn get_heal_data(&self, pgid: PgId) -> Vec<(String, u64)> {
+        self.kv
+            .range(
+                pgid.to_string() + "."
+                    ..(pgid).to_string() + &format!("{}", ('.' as u8 + 1) as char),
+            )
+            .map(|(k, v)| (k.clone(), v.version))
+            .collect()
+    }
+
+    fn push_heal_data(&mut self, pgid: PgId, data: Vec<(String, Value)>) {
+        for (key, value) in data {
+            assert_eq!(
+                key.split(".").next().unwrap().parse::<PgId>().unwrap(),
+                pgid
+            );
+            self.kv.insert(key, value);
+        }
     }
 }
 

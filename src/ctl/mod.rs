@@ -3,24 +3,21 @@ use crate::{
     constant::*,
     distributor::{Distributor, SimpleHashDistributor},
     monitor::{client::ServerClient, TargetMap},
-    rpc::{ConsultPgInfo, ForwardReq, Get, KvRequest, Put, Recover, RecoverRes},
+    rpc::{
+        ConsultPgInfo, ForwardReq, Get, HealJobReq, HealReq, KvRequest, Put, Recover, RecoverRes,
+    },
     service::Store,
     Error, PgId, PgVersion, Result,
 };
-use futures::{
-    channel::mpsc,
-    lock::Mutex,
-    stream::{FuturesOrdered, FuturesUnordered},
-    StreamExt,
-};
-use log::{error, info, warn};
+use futures::{channel::mpsc, lock::Mutex, stream::FuturesUnordered, StreamExt};
+use log::{info, warn};
 use madsim::{net::NetLocalHandle, task, time::sleep};
 use serde::{Deserialize, Serialize};
-use std::{fmt::Debug, io, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, sync::Arc, time::Duration};
 
-mod heal;
-mod peer;
-mod recover;
+pub mod heal;
+pub mod peer;
+pub mod recover;
 
 /// Reliable wrapper of service
 /// PG information is stored in `inner.service` K/V
@@ -129,43 +126,6 @@ where
     }
 
     /*
-     * Background task
-     */
-    async fn background_recovery(&self) {
-        let mut watch_version = self.get_target_map().get_version();
-        loop {
-            self.monitor_client
-                .watch_for_target_map(Some(watch_version))
-                .await;
-            let target_map = self.get_target_map();
-            for pgid in 0..PG_NUM {
-                let target_addrs = self.distributor.locate(pgid, &target_map);
-                if target_addrs.iter().any(|addr| *addr == self.local_addr()) {
-                    let local_info = self.inner.lock().await.get_pg_info(pgid);
-                    match local_info.state {
-                        PgState::Active => {}
-                        PgState::Absent | PgState::Inactive => {
-                            warn!("Start recovering pg {}", pgid);
-                            if let Err(err) = self.recover_for(pgid, target_addrs[0].clone()).await
-                            {
-                                error!(
-                                    "Error occur when recovering pg {} from primary {}: {}",
-                                    pgid, target_addrs[0], err
-                                );
-                                continue;
-                            }
-                        }
-                        PgState::Stale | PgState::Unprepared => {
-                            // For now we did not cares about stale or unprepraed state in recovery
-                        }
-                    }
-                }
-            }
-            watch_version = target_map.get_version();
-        }
-    }
-
-    /*
      * RPC Handler
      */
 
@@ -195,7 +155,7 @@ where
         let pgid = self.distributor.assign_pgid(request.key().as_bytes());
         self.check_pg_state(pgid).await?;
 
-        if self.is_primary(request.key()) || self.is_secondary(request.key()) {
+        if self.is_responsible_pg(pgid) {
             Ok(self.inner.lock().await.get(request.key()))
         } else {
             Err(Error::WrongTarget)
@@ -233,9 +193,46 @@ where
     }
 
     #[rpc]
-    async fn consult_pg_info(&self, request: ConsultPgInfo) -> PgInfo {
-        let ConsultPgInfo(pgid) = request;
-        self.inner.lock().await.get_pg_info(pgid)
+    async fn consult_pg_info(&self, request: ConsultPgInfo) -> HashMap<PgId, PgInfo> {
+        let ConsultPgInfo(pgs) = request;
+        let inner = self.inner.lock().await;
+        pgs.into_iter()
+            .map(|pgid| (pgid, inner.get_pg_info(pgid)))
+            .collect()
+    }
+
+    #[rpc]
+    async fn heal_job(&self, request: HealJobReq) -> Result<()> {
+        let HealJobReq(job) = request;
+        let pgid = job.pgid;
+        self.check_pg_state(pgid).await?;
+        self.heal_tx
+            .unbounded_send(job)
+            .expect("Send Heal jobs on futures::channel failed");
+        info!("Pg {}'s heal job has been push to queue", pgid);
+        Ok(())
+    }
+
+    #[rpc]
+    async fn heal(&self, request: HealReq) -> Result<()> {
+        let HealReq {
+            pgid,
+            pg_version,
+            data,
+        } = request;
+        let mut inner = self.inner.lock().await;
+        let local_pg_version = inner.get_pg_info(pgid).version;
+        if local_pg_version > pg_version {
+            return Err(Error::PgNotNewer);
+        }
+        inner.service.push_heal_data(pgid, data);
+        inner.update_pg_info(pgid, |mut pg_info| {
+            pg_info.version = pg_version;
+            pg_info.state = PgState::Active;
+            pg_info
+        });
+        warn!("Pg {} has been healed", pgid);
+        Ok(())
     }
 
     async fn forward_put_by_primary(&self, request: Put) -> Result<()> {
@@ -289,8 +286,13 @@ where
         target_addrs
             .iter()
             .skip(1)
-            .find(|addr| **addr == self.local_addr())
-            .is_some()
+            .any(|addr| *addr == self.local_addr())
+    }
+
+    fn is_responsible_pg(&self, pgid: PgId) -> bool {
+        let target_map = self.get_target_map();
+        let target_addrs = self.distributor.locate(pgid, &target_map);
+        target_addrs.iter().any(|addr| *addr == self.local_addr())
     }
 
     fn get_target_map(&self) -> TargetMap {
@@ -306,7 +308,7 @@ where
     async fn check_pg_state(&self, pgid: PgId) -> Result<()> {
         match self.inner.lock().await.get_pg_info(pgid).state {
             // TODO: Can stale pg pass checking ?
-            PgState::Active | PgState::Stale => Ok(()),
+            PgState::Active => Ok(()),
             PgState::Inactive => Err(Error::WrongTarget),
             // Unprepared, Absent
             x => Err(Error::PgUnavailable(x)),

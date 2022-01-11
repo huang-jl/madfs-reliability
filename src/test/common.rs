@@ -1,19 +1,12 @@
-use crate::{
-    constant::REPLICA_SIZE,
-    ctl::ReliableCtl,
-    distributor::{Distributor, SimpleHashDistributor},
-    monitor::{
+use crate::{Error, PgId, Result, constant::REPLICA_SIZE, ctl::ReliableCtl, distributor::{Distributor, SimpleHashDistributor}, monitor::{
         client::{Client as MonitorClient, ServerClient},
         Monitor,
-    },
-    rpc::KvRequest,
-    service::KvService,
-    Error, Result,
-};
+    }, rpc::KvRequest, service::KvService};
 use lazy_static::lazy_static;
 use log::*;
 use madsim::{
     net::{rpc::Request, NetLocalHandle},
+    time::sleep,
     Handle, LocalHandle,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -136,6 +129,10 @@ impl Client {
         self.send_to(request, targets[0], retry).await
     }
 
+    pub fn get_pgid(&self, key: &[u8]) -> PgId {
+        self.distributor.assign_pgid(key)
+    }
+
     pub async fn get_target_addrs(&self, key: &[u8]) -> [SocketAddr; REPLICA_SIZE] {
         let pgid = self.distributor.assign_pgid(key);
         let target_map = self.monitor_client.get_local_target_map().await;
@@ -164,6 +161,7 @@ impl Client {
                                 Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
                                 Err(err) => return Err(Error::NetworkError(err.to_string())),
                             }
+                            sleep(Duration::from_millis(2000)).await;
                         }
                         Err(Error::NetworkError(
                             std::io::Error::from(ErrorKind::TimedOut).to_string(),

@@ -3,13 +3,12 @@ use crate::{
     constant::*,
     monitor::client::Client as MonitorClient,
     rpc::{Get, KvRequest, Put},
-    Error,
 };
 pub use common::{create_monitor, gen_random_put, Client, KvServerCluster};
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::info;
+use log::{info, warn};
 use madsim::time::sleep;
-use std::{collections::HashMap, time::Duration};
+use std::collections::HashMap;
 
 pub mod common;
 
@@ -75,7 +74,7 @@ async fn one_server_crash() {
 
     for _ in 0..100 {
         let (key, value) = gen_random_put(10, 20);
-        golden.insert(key.clone(), value.clone());
+        golden.insert(key.clone(), vec![value.clone()]);
         let request = Put { key, value };
 
         let res = client.send(request.clone(), None).await;
@@ -96,17 +95,22 @@ async fn one_server_crash() {
     }
     // Server 0 is crashed
     cluster.crash(CRASH_TARGET_IDX);
-    info!("Server crash!");
+    warn!("Server crash!");
+    // Wait for a peer period for each server to update their pg state
+    sleep(Duration::from_millis(7_000)).await;
 
     let mut tasks = keys
         .iter()
         .map(|key| {
             let client = client.clone();
+            let (_, value) = gen_random_put(5, 20);
+            golden
+                .entry(key.to_string())
+                .and_modify(|val| val.push(value.clone()));
             async move {
-                let (_, value) = gen_random_put(10, 20);
                 let request = Put {
                     key: key.clone(),
-                    value,
+                    value: value.clone(),
                 };
                 let res = client.send(request, None).await;
                 info!("Send Put after server crash, response : {:?}", res);
@@ -116,15 +120,24 @@ async fn one_server_crash() {
         .collect::<FuturesUnordered<_>>();
     while let Some(_) = tasks.next().await {}
 
-    // wait for monitor marks it OUT
+    // wait for system to recover
     sleep(Duration::from_millis(20_000)).await;
     client.monitor_client.update_target_map().await;
 
+    // Here we check that the data is consistent among all replicas and
+    // check the final state is some value we put before instead of some damaged or weird data.
     for (key, value) in golden.iter() {
         let targets = client.get_target_addrs(key.as_bytes()).await;
+        let mut target_vals = Vec::new();
         for target in targets {
             let res = client.send_to(Get(key.clone()), target, None).await;
-            assert_eq!(&res.unwrap().unwrap().unwrap(), value);
+            let res = res.unwrap().unwrap().unwrap();
+            target_vals.push(res);
         }
+        assert!(target_vals
+            .iter()
+            .zip(target_vals.iter().skip(1))
+            .all(|(a, b)| a == b));
+        assert!(target_vals.iter().all(|val| value.iter().any(|v| v == val)));
     }
 }

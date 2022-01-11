@@ -1,6 +1,7 @@
-use crate::{PgId, PgVersion, Result, TargetMapVersion, ctl::PgInfo, monitor::*};
+use crate::{PgId, PgVersion, Result, TargetMapVersion, ctl::{PgInfo, heal::HealJob}, monitor::*, service::Value};
 use madsim::{net::rpc::Request, Request};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 pub trait KvRequest: Request {
     fn key(&self) -> &str;
@@ -26,8 +27,22 @@ where
     T: Request;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
-#[rtype("PgInfo")]
-pub struct ConsultPgInfo(pub PgId);
+#[rtype("HashMap<PgId, PgInfo>")]
+pub struct ConsultPgInfo(pub Vec<PgId>);
+
+#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[rtype("Result<()>")]
+/// When some server find its local pg is stale, it will send this kind of request to the up-to-date server.
+/// The up-to-date server will add `HealJob` to its healing procedure queue.
+pub struct HealJobReq(pub HealJob);
+
+#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[rtype("Result<()>")]
+pub struct HealReq {
+    pub pgid: PgId,
+    pub pg_version: PgVersion,
+    pub data: Vec<(String, Value)>,
+}
 
 impl KvRequest for Get {
     fn key(&self) -> &str {

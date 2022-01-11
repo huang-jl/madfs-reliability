@@ -30,7 +30,11 @@ mod constant {
     pub const RECOVER_TIMEOUT: Duration = Duration::from_millis(3000);
     pub const RECOVER_RETRY: u32 = 3;
 
-    pub const CONSULT_TIMEOUT: Duration = Duration::from_millis(1000);
+    /// Timeout of peering request
+    pub const CONSULT_TIMEOUT: Duration = Duration::from_millis(500);
+
+    pub const HEAL_REQ_TIMEOUT: Duration = Duration::from_millis(3000);
+    pub const HEAL_JOB_REQ_TIMEOUT: Duration = Duration::from_millis(1500);
 }
 
 pub type PgId = usize;
@@ -42,7 +46,7 @@ pub type PgVersion = u64;
 pub enum Error {
     #[error("The requested server is not primary")]
     NotPrimary,
-    #[error("The target is not responsible for the request's key")]
+    #[error("The target is not responsible for the request's key or pgid")]
     WrongTarget,
     #[error("Network error: {0}")]
     NetworkError(String),
@@ -50,6 +54,8 @@ pub enum Error {
     VersionDoesNotExist(u64),
     #[error("The pg on corressponding server is unavailable: {0:?}")]
     PgUnavailable(PgState),
+    #[error("The pg is not more up-to-date")]
+    PgNotNewer, // Used when find peers send some pg which is not more up-to-date during healing
 }
 
 impl From<std::io::Error> for Error {
