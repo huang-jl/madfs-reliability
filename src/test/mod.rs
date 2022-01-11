@@ -96,8 +96,6 @@ async fn one_server_crash() {
     // Server 0 is crashed
     cluster.crash(CRASH_TARGET_IDX);
     warn!("Server crash!");
-    // Wait for a peer period for each server to update their pg state
-    sleep(Duration::from_millis(7_000)).await;
 
     let mut tasks = keys
         .iter()
@@ -121,7 +119,7 @@ async fn one_server_crash() {
     while let Some(_) = tasks.next().await {}
 
     // wait for system to recover
-    sleep(Duration::from_millis(20_000)).await;
+    sleep(Duration::from_millis(25_000)).await;
     client.monitor_client.update_target_map().await;
 
     // Here we check that the data is consistent among all replicas and

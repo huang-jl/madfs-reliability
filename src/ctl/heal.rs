@@ -37,9 +37,12 @@ where
         let request = {
             let inner = self.inner.lock().await;
             let local_keys = inner.service.get_heal_data(pgid);
+            // Only keep those in `local_keys`:
+            // 1. do not exist in `keys`
+            // 2. version is greater than version in `keys`
             let res = local_keys
                 .into_iter()
-                .filter(|(key, ver)| keys.get(key).map_or(true, |local_ver| local_ver > ver))
+                .filter(|(key, local_ver)| keys.get(key).map_or(true, |ver| local_ver > ver))
                 .map(|(key, ver)| {
                     let value = Value {
                         data: inner.service.get(&key).unwrap(),
