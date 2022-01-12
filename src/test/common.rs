@@ -1,7 +1,15 @@
-use crate::{Error, PgId, Result, constant::REPLICA_SIZE, ctl::ReliableCtl, distributor::{Distributor, SimpleHashDistributor}, monitor::{
+use crate::{
+    constant::*,
+    ctl::ReliableCtl,
+    distributor::{Distributor, SimpleHashDistributor},
+    monitor::{
         client::{Client as MonitorClient, ServerClient},
         Monitor,
-    }, rpc::KvRequest, service::KvService};
+    },
+    rpc::KvRequest,
+    service::KvService,
+    Error, PgId, Result,
+};
 use lazy_static::lazy_static;
 use log::*;
 use madsim::{
@@ -34,7 +42,6 @@ enum ClientError {
 
 pub struct KvServerCluster {
     servers: Vec<ReliableCtl<KvService>>,
-    addrs: Vec<SocketAddr>,
     handle: Handle,
 }
 
@@ -83,10 +90,11 @@ pub fn gen_random_put(key_len: usize, val_len: usize) -> (String, Vec<u8>) {
 /// - `server_addrs` - list of serivce servers
 ///
 /// For now we assumes that there will be no new server added to cluster
-pub async fn create_monitor(pg_num: usize, addr: &str, server_addrs: Vec<SocketAddr>) -> Monitor {
-    let addr = addr.parse::<SocketAddr>().unwrap();
+pub async fn create_monitor(pg_num: usize, server_addrs: Vec<SocketAddr>) -> Monitor {
     let handle = madsim::Handle::current();
-    let host = handle.create_host(addr).unwrap();
+    let host = handle
+        .create_host(MONITOR_ADDR.parse::<SocketAddr>().unwrap())
+        .unwrap();
     handle.net.connect(host.local_addr());
     host.spawn(async move { Monitor::new(pg_num, server_addrs) })
         .await
@@ -175,22 +183,50 @@ impl Client {
             })
             .await
     }
+
+    pub async fn update_target_map(&self) {
+        let this = self.clone();
+        self.handle
+            .spawn(async move {
+                this.monitor_client.update_target_map().await;
+            })
+            .await;
+    }
+
+    // We check that the data is consistent/same among all replicas and
+    // check the final state is some value we put before instead of some damaged or weird data.
+    pub async fn check_consistency(&self, key: &str, potential_vals: &[Vec<u8>]) {
+        let targets = self.get_target_addrs(key.as_bytes()).await;
+        let mut target_vals = Vec::new();
+        for target in targets {
+            let res = self
+                .send_to(crate::rpc::Get(key.to_owned()), target, None)
+                .await;
+            assert!(matches!(res, Ok(Ok(Some(_)))), "Send get to {} get : {:?}", target, res);
+            let res = res.unwrap().unwrap().unwrap();
+            target_vals.push(res);
+        }
+        assert!(target_vals
+            .iter()
+            .zip(target_vals.iter().skip(1))
+            .all(|(a, b)| a == b));
+        assert!(target_vals
+            .iter()
+            .all(|val| potential_vals.iter().any(|v| v == val)));
+    }
 }
 
 impl KvServerCluster {
-    pub async fn new(server_num: usize, monitor_addr: &str) -> Self {
-        let monitor_addr = monitor_addr.parse().unwrap();
+    pub async fn new(server_num: usize) -> Self {
+        let monitor_addr = MONITOR_ADDR.parse().unwrap();
         let handle = Handle::current();
-        let addrs = (0..server_num)
-            .map(|id| SocketAddr::from(([0, 0, 1, id as u8], 0)))
-            .collect::<Vec<_>>();
-        addrs.iter().for_each(|addr| {
-            handle.create_host(addr).unwrap();
-            handle.net.connect(addr.clone());
-        });
         let mut servers = Vec::new();
         for id in 0..server_num {
-            let local_handle = handle.get_host(addrs[id]).unwrap();
+            let local_handle = handle.create_host(gen_server_addr(id)).unwrap();
+            handle.net.connect(local_handle.local_addr());
+        }
+        for id in 0..server_num {
+            let local_handle = handle.get_host(gen_server_addr(id)).unwrap();
             servers.push(
                 local_handle
                     .spawn(async move {
@@ -202,26 +238,33 @@ impl KvServerCluster {
                     .await,
             );
         }
-        KvServerCluster {
-            servers,
-            addrs,
-            handle,
-        }
-    }
-
-    pub fn get_addrs(&self) -> Vec<SocketAddr> {
-        self.addrs.clone()
+        KvServerCluster { servers, handle }
     }
 
     pub fn crash(&self, idx: usize) {
-        self.handle.kill(self.addrs[idx]);
+        self.handle.kill(gen_server_addr(idx));
+    }
+
+    pub async fn restart(&self, idx: usize) {
+        let handle = Handle::current();
+        let local_handle = handle.create_host(gen_server_addr(idx)).unwrap();
+        local_handle
+            .spawn(async move {
+                ReliableCtl::new(
+                    KvService::new(),
+                    ServerClient::new(idx as _, MONITOR_ADDR.parse().unwrap())
+                        .await
+                        .unwrap(),
+                )
+            })
+            .await;
     }
 
     pub fn disconnect(&self, idx: usize) {
-        self.handle.net.disconnect(self.addrs[idx]);
+        self.handle.net.disconnect(gen_server_addr(idx));
     }
 
     pub fn connect(&self, idx: usize) {
-        self.handle.net.connect(self.addrs[idx]);
+        self.handle.net.connect(gen_server_addr(idx));
     }
 }

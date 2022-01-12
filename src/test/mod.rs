@@ -5,10 +5,10 @@ use crate::{
     rpc::{Get, KvRequest, Put},
 };
 pub use common::{create_monitor, gen_random_put, Client, KvServerCluster};
-use futures::stream::{FuturesUnordered, StreamExt};
+use futures::stream::{self, FuturesUnordered, StreamExt};
 use log::{info, warn};
 use madsim::time::sleep;
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Duration};
 
 pub mod common;
 
@@ -21,11 +21,10 @@ async fn cluster_simple_test() {
 
     let _monitor = create_monitor(
         PG_NUM,
-        MONITOR_ADDR,
         (0..SERVER_NUM).map(|id| gen_server_addr(id)).collect(),
     )
     .await;
-    let _cluster = KvServerCluster::new(SERVER_NUM, MONITOR_ADDR).await;
+    let _cluster = KvServerCluster::new(SERVER_NUM).await;
     let client = Client::new(
         0,
         MonitorClient::new(str_to_addr(MONITOR_ADDR)).await.unwrap(),
@@ -34,7 +33,7 @@ async fn cluster_simple_test() {
     // Wait for the cluster to start up (peering)
     sleep(Duration::from_millis(5000)).await;
 
-    for _ in 0..100 {
+    for _ in 0..1000 {
         let (key, value) = gen_random_put(10, 20);
         let request = Put { key, value };
 
@@ -57,11 +56,10 @@ async fn one_server_crash() {
 
     let _monitor = create_monitor(
         PG_NUM,
-        MONITOR_ADDR,
         (0..SERVER_NUM).map(|id| gen_server_addr(id)).collect(),
     )
     .await;
-    let cluster = KvServerCluster::new(SERVER_NUM, MONITOR_ADDR).await;
+    let cluster = KvServerCluster::new(SERVER_NUM).await;
     let client = Client::new(
         0,
         MonitorClient::new(str_to_addr(MONITOR_ADDR)).await.unwrap(),
@@ -72,7 +70,8 @@ async fn one_server_crash() {
     // Wait for the cluster to start up (peering)
     sleep(Duration::from_millis(5000)).await;
 
-    for _ in 0..100 {
+    // Put some random keys
+    for _ in 0..3000 {
         let (key, value) = gen_random_put(10, 20);
         golden.insert(key.clone(), vec![value.clone()]);
         let request = Put { key, value };
@@ -81,22 +80,23 @@ async fn one_server_crash() {
         assert!(matches!(res, Ok(Ok(_))));
     }
 
+    // Find the keys which are stored on CRASH server
     let mut keys = Vec::new();
-    let crash_addr = cluster.get_addrs()[CRASH_TARGET_IDX];
-    for (key, _) in golden.iter() {
+    for key in golden.keys() {
         if client
             .get_target_addrs(key.as_bytes())
             .await
             .iter()
-            .any(|addr| *addr == crash_addr)
+            .any(|addr| *addr == gen_server_addr(CRASH_TARGET_IDX))
         {
-            keys.push(key.clone());
+            keys.push(key.to_owned());
         }
     }
     // Server 0 is crashed
     cluster.crash(CRASH_TARGET_IDX);
     warn!("Server crash!");
 
+    // Make sure all keys is unavaiable right after the server is crash
     let mut tasks = keys
         .iter()
         .map(|key| {
@@ -107,7 +107,7 @@ async fn one_server_crash() {
                 .and_modify(|val| val.push(value.clone()));
             async move {
                 let request = Put {
-                    key: key.clone(),
+                    key: key.to_string(),
                     value: value.clone(),
                 };
                 let res = client.send(request, None).await;
@@ -120,22 +120,54 @@ async fn one_server_crash() {
 
     // wait for system to recover
     sleep(Duration::from_millis(25_000)).await;
-    client.monitor_client.update_target_map().await;
+    client.update_target_map().await;
 
-    // Here we check that the data is consistent among all replicas and
-    // check the final state is some value we put before instead of some damaged or weird data.
     for (key, value) in golden.iter() {
-        let targets = client.get_target_addrs(key.as_bytes()).await;
-        let mut target_vals = Vec::new();
-        for target in targets {
-            let res = client.send_to(Get(key.clone()), target, None).await;
-            let res = res.unwrap().unwrap().unwrap();
-            target_vals.push(res);
-        }
-        assert!(target_vals
-            .iter()
-            .zip(target_vals.iter().skip(1))
-            .all(|(a, b)| a == b));
-        assert!(target_vals.iter().all(|val| value.iter().any(|v| v == val)));
+        client.check_consistency(key, value).await;
+    }
+}
+
+#[madsim::test]
+async fn crash_and_up() {
+    const SERVER_NUM: usize = 10;
+    const CRASH_TARGET_IDX: usize = 0;
+
+    let _monitor = create_monitor(
+        PG_NUM,
+        (0..SERVER_NUM).map(|id| gen_server_addr(id)).collect(),
+    )
+    .await;
+    let cluster = KvServerCluster::new(SERVER_NUM).await;
+    let client = Client::new(
+        0,
+        MonitorClient::new(str_to_addr(MONITOR_ADDR)).await.unwrap(),
+    );
+
+    let mut golden = HashMap::new();
+
+    // Wait for the cluster to start up (peering)
+    sleep(Duration::from_millis(5000)).await;
+
+    // Put some random keys
+    for _ in 0..3000 {
+        let (key, value) = gen_random_put(10, 20);
+        golden.insert(key.clone(), vec![value.clone()]);
+        let request = Put { key, value };
+
+        let res = client.send(request.clone(), None).await;
+        assert!(matches!(res, Ok(Ok(_))));
+    }
+
+    // Server 0 is crashed and then restart
+    cluster.crash(CRASH_TARGET_IDX);
+    warn!("Server crash!");
+    sleep(Duration::from_millis(25_000)).await;
+    cluster.restart(CRASH_TARGET_IDX).await;
+    warn!("Server restart!");
+    sleep(Duration::from_millis(15_000)).await;
+
+    client.update_target_map().await;
+    for (key, value) in golden.iter() {
+        client.check_consistency(key, value).await;
     }
 }

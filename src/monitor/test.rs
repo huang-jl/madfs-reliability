@@ -13,13 +13,12 @@ async fn create_server_client(id: usize, monitor_addr: &str) -> Arc<ServerClient
 }
 
 #[madsim::test]
-async fn monitor_simple_test() {
+async fn monitor_basic_test() {
     const SERVER_NUM: usize = 10;
     const PG_NUM: usize = 256;
 
     let monitor = create_monitor(
         PG_NUM,
-        MONITOR_ADDR,
         (0..SERVER_NUM).map(|id| gen_server_addr(id)).collect(),
     )
     .await;

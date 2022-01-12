@@ -66,7 +66,9 @@ impl Store for KvService {
                         ..(pgid).to_string() + &format!("{}", ('.' as u8 + 1) as char)
                 )
                 .count(),
-            0
+            0,
+            "push data to pg {}, but it already has keys",
+            pgid
         );
         //2. push the pg data into kv
         let mut pg_data: BTreeMap<String, Value> = bincode::deserialize(&data).unwrap();

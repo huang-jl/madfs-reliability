@@ -44,6 +44,11 @@ where
                 pg_info.state = PgState::Unprepared;
                 pg_info
             });
+        } else if self.check_absent(pgid, &peer_res).await {
+            self.inner.lock().await.update_pg_info(pgid, |mut pg_info| {
+                pg_info.state = PgState::Absent;
+                pg_info
+            });
         } else if self.check_stale(pgid, &peer_res).await {
             warn!("Detect pg {} is stale", pgid);
             // mark this pg as stale
@@ -68,7 +73,16 @@ where
     async fn collect_pg_info(&self) -> HashMap<PgId, Vec<(SocketAddr, PgInfo)>> {
         let mut requests: HashMap<SocketAddr, Vec<PgId>> = HashMap::new();
         let target_map = self.get_target_map();
-        for pgid in (0..PG_NUM).into_iter() {
+        // Only need to collect pgs which its state not in Absent.
+        // The absent pg will be solved by recovery procedure.
+        let pgids = {
+            let inner = self.inner.lock().await;
+            (0..PG_NUM)
+                .filter(|&pgid| inner.get_pg_info(pgid).state != PgState::Absent)
+                .collect::<Vec<_>>()
+        };
+        for pgid in pgids {
+            // 1. skip those out of responsibility
             let peers = self.distributor.locate(pgid, &target_map);
             if !peers.iter().any(|addr| *addr == self.local_addr()) {
                 continue;
@@ -93,7 +107,10 @@ where
         let mut res: HashMap<PgId, Vec<(SocketAddr, PgInfo)>> = HashMap::new();
         for (addr, result) in results.into_iter().filter(|(addr, res)| match res {
             Err(err) => {
-                warn!("Networking error happened during peering with {}: {}", addr, err);
+                warn!(
+                    "Networking error happened during peering with {}: {}",
+                    addr, err
+                );
                 false
             }
             _ => true,
@@ -121,7 +138,9 @@ where
         // Find the largest version number among peers
         if let Some((addr, pg_info)) = peer_res.iter().max_by(|a, b| a.1.version.cmp(&b.1.version))
         {
-            if pg_info.version > local_pg_version {
+            // If local_pg_version == 0, then it cannot be stale.
+            // It can only be absent or the cluster just make a fresh start.
+            if pg_info.version > local_pg_version && local_pg_version > 0 {
                 // send heal request
                 let request = HealJobReq(HealJob {
                     addr: self.local_addr(),
@@ -140,5 +159,10 @@ where
             }
         }
         false
+    }
+
+    async fn check_absent(&self, pgid: PgId, peer_res: &Vec<(SocketAddr, PgInfo)>) -> bool {
+        let local_pg_version = self.inner.lock().await.get_pg_info(pgid).version;
+        local_pg_version == 0 && peer_res.iter().any(|(_, pg_info)| pg_info.version > 0)
     }
 }

@@ -17,10 +17,11 @@ pub mod client;
 mod test;
 
 #[derive(Debug, Clone)]
-/// Simple Monitor: Assume it will nerver crash or make mistakes.
+/// Simple Monitor: Assume monitor itself will nerver crash or make mistakes.
 /// In production Monitor service should be maintained by clusters running Raft.
 ///
-/// For now also assume that we cannot add server after init the cluster.
+/// For now also assume that we cannot add more servers after initializing the cluster.
+/// But some servers can crash and then restart to join in the cluster again.
 pub struct Monitor {
     inner: Arc<Mutex<Inner>>,
 }
@@ -29,6 +30,7 @@ pub struct Monitor {
 struct Inner {
     target_map: BTreeMap<TargetMapVersion, TargetMap>,
     heartbeat: Vec<Instant>,
+    addrs: Vec<SocketAddr>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -106,9 +108,10 @@ impl Inner {
     fn new(pg_num: usize, server_addrs: Vec<SocketAddr>) -> Self {
         Inner {
             heartbeat: (0..server_addrs.len()).map(|_| Instant::now()).collect(),
-            target_map: [(0, TargetMap::empty()), (1, TargetMap::init(server_addrs))]
+            target_map: [(0, TargetMap::empty()), (1, TargetMap::init(server_addrs.clone()))]
                 .into_iter()
                 .collect(),
+            addrs: server_addrs,
         }
     }
 
@@ -162,7 +165,7 @@ impl Inner {
             .map
             .iter_mut()
             .enumerate()
-            .filter(|(_, info)| info.is_down_in())
+            .filter(|(_, info)| info.is_down() && info.is_in())
             .for_each(|(id, target_info)| {
                 if self.heartbeat[id].elapsed() > OUT_TIMEOUT {
                     warn!("Target {} be marked Down & Out", id);
@@ -170,6 +173,13 @@ impl Inner {
                     update = true;
                 }
             });
+        target_map.map.iter_mut().enumerate().filter(|(_, info)| info.is_down()).for_each(|(id, target_info)|{
+            if self.heartbeat[id].elapsed() < DOWN_TIMEOUT {
+                info!("Target {} has been marked down but restart now", id);
+                target_info.state = TargetState::UpIn(self.addrs[id]);
+                update = true;
+            }
+        });
         if update {
             target_map.version += 1;
             self.target_map.insert(target_map.version, target_map);
@@ -229,11 +239,11 @@ impl TargetInfo {
         matches!(self.state, TargetState::UpIn(..))
     }
 
-    pub fn is_down_in(&self) -> bool {
-        matches!(self.state, TargetState::DownIn)
-    }
-
     pub fn is_in(&self) -> bool {
         matches!(self.state, TargetState::UpIn(..) | TargetState::DownIn)
+    }
+
+    pub fn is_down(&self) -> bool {
+        matches!(self.state, TargetState::DownOut | TargetState::DownIn)
     }
 }
