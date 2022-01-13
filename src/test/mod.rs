@@ -72,7 +72,7 @@ async fn one_server_crash() {
 
     // Put some random keys
     for _ in 0..3000 {
-        let (key, value) = gen_random_put(10, 20);
+        let (key, value) = gen_random_put(5, 10);
         golden.insert(key.clone(), vec![value.clone()]);
         let request = Put { key, value };
 
@@ -101,7 +101,7 @@ async fn one_server_crash() {
         .iter()
         .map(|key| {
             let client = client.clone();
-            let (_, value) = gen_random_put(5, 20);
+            let (_, value) = gen_random_put(5, 10);
             golden
                 .entry(key.to_string())
                 .and_modify(|val| val.push(value.clone()));
@@ -150,7 +150,7 @@ async fn crash_and_up() {
 
     // Put some random keys
     for _ in 0..3000 {
-        let (key, value) = gen_random_put(10, 20);
+        let (key, value) = gen_random_put(5, 10);
         golden.insert(key.clone(), vec![value.clone()]);
         let request = Put { key, value };
 

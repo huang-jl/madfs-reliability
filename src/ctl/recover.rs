@@ -51,7 +51,10 @@ where
         let mut response: Option<RecoverRes> = None;
         for _ in 0..RECOVER_RETRY {
             let request = Recover(pgid);
-            match net.call_timeout(target_addr, request, RECOVER_TIMEOUT).await {
+            match net
+                .call_timeout(target_addr, request, RECOVER_TIMEOUT)
+                .await
+            {
                 Ok(res) => response = Some(res?),
                 Err(err) => {
                     warn!("Send Recover request get error: {}", err);
@@ -66,6 +69,7 @@ where
                 inner.service.push_pg_data(pgid, data);
                 inner.set_pg_state(pgid, PgState::Active);
                 inner.set_pg_version(pgid, version);
+                inner.persist().await;
                 Ok(())
             }
             None => Err(Error::NetworkError(format!(

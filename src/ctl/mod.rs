@@ -11,7 +11,11 @@ use crate::{
 };
 use futures::{channel::mpsc, lock::Mutex, stream::FuturesUnordered, StreamExt};
 use log::{debug, info, warn};
-use madsim::{net::NetLocalHandle, task, time::sleep};
+use madsim::{
+    fs::{self, File},
+    net::NetLocalHandle,
+    task,
+};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, sync::Arc, time::Duration};
 
@@ -88,6 +92,10 @@ where
     /// 2. add rpc handler
     /// 3. start background procedure
     async fn init(&self, heal_rx: mpsc::UnboundedReceiver<HealJob>) {
+        // try to recover from disk
+        if let Ok(content) = fs::read(FILE_PATH).await {
+            self.inner.lock().await.service.install(content);
+        }
         let mut inner = self.inner.lock().await;
         (0..PG_NUM)
             .filter(|&pgid| self.is_responsible_pg(pgid))
@@ -149,6 +157,7 @@ where
                 request.value().unwrap().to_owned(),
             );
             inner.set_pg_state(pgid, PgState::Active);
+            inner.persist().await;
             Ok(())
         } else {
             Err(Error::NotPrimary)
@@ -179,13 +188,15 @@ where
             request.key(),
             pgid
         );
-        self.inner.lock().await.check_pg_state(pgid)?;
+        let mut inner = self.inner.lock().await;
+        inner.check_pg_state(pgid)?;
 
         if !self.is_secondary(request.key()) {
             return Err(Error::WrongTarget);
         }
         let (key, value) = request.take();
-        self.inner.lock().await.put(key.unwrap(), value.unwrap());
+        inner.put(key.unwrap(), value.unwrap());
+        inner.persist().await;
         Ok(())
     }
 
@@ -193,9 +204,9 @@ where
     /// Handler for recover request from peer server.
     async fn recover(&self, request: Recover) -> Result<RecoverRes> {
         let Recover(pgid) = request;
-        self.inner.lock().await.check_pg_state(pgid)?;
-
         let inner = self.inner.lock().await;
+        inner.check_pg_state(pgid)?;
+
         let pg_ver = inner.get_pg_version(pgid);
         Ok(RecoverRes {
             data: inner.service.get_pg_data(pgid),
@@ -237,6 +248,7 @@ where
         inner.service.push_heal_data(pgid, data);
         inner.set_pg_state(pgid, PgState::Active);
         inner.set_pg_version(pgid, pg_ver);
+        inner.persist().await;
         warn!("Pg {} has been healed", pgid);
         Ok(())
     }
@@ -330,6 +342,16 @@ where
     /*
      * Helper methods
      */
+
+    async fn persist(&self) {
+        let snapshot = self.service.snapshot();
+        let file = File::create(FILE_PATH)
+            .await
+            .expect("Creating file when persisting data fail");
+        file.write_all_at(&snapshot, 0)
+            .await
+            .expect("Writing file when persisting data fail");
+    }
 
     fn put(&mut self, key: String, value: Vec<u8>) {
         let pgid = self.distributor.assign_pgid(key.as_bytes());

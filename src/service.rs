@@ -17,6 +17,8 @@ pub trait Store {
     fn get_heal_data(&self, pgid: PgId) -> Vec<(String, u64)>;
     /// Push the updated (key, value) pair from `data` into pg `pgid`.
     fn push_heal_data(&mut self, pgid: PgId, data: Vec<(String, Value)>);
+    fn snapshot(&self) -> Vec<u8>;
+    fn install(&mut self, snapshot: Vec<u8>);
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -97,6 +99,14 @@ impl Store for KvService {
             );
             self.kv.insert(key, value);
         }
+    }
+
+    fn snapshot(&self) -> Vec<u8> {
+        bincode::serialize(&self.kv).unwrap()
+    }
+
+    fn install(&mut self, snapshot: Vec<u8>) {
+        self.kv = bincode::deserialize(&snapshot).unwrap();
     }
 }
 

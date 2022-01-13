@@ -17,6 +17,7 @@ mod constant {
     pub const REPLICA_SIZE: usize = 3;
     pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
     pub const PG_NUM: usize = 256;
+    pub const FILE_PATH: &str = "service.blob";
 
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(1000);
     pub const FORWARD_RETRY: u32 = 3;
