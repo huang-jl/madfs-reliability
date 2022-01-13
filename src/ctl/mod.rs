@@ -4,13 +4,13 @@ use crate::{
     distributor::{Distributor, SimpleHashDistributor},
     monitor::{client::ServerClient, TargetMap},
     rpc::{
-        ConsultPgInfo, ForwardReq, Get, HealJobReq, HealReq, KvRequest, Put, Recover, RecoverRes,
+        ConsultPgVersion, ForwardReq, Get, HealJobReq, HealReq, KvRequest, Put, Recover, RecoverRes,
     },
     service::Store,
     Error, PgId, PgVersion, Result,
 };
 use futures::{channel::mpsc, lock::Mutex, stream::FuturesUnordered, StreamExt};
-use log::{info, warn};
+use log::{debug, info, warn};
 use madsim::{net::NetLocalHandle, task, time::sleep};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, fmt::Debug, io, net::SocketAddr, sync::Arc, time::Duration};
@@ -47,17 +47,10 @@ where
 struct Inner<T> {
     service: T,
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
+    pg_states: Vec<PgState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PgInfo {
-    /// version = 0 means this pg is not served before,
-    /// since the first `put` will increment version to 1.
-    version: PgVersion,
-    state: PgState,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PgState {
     /// Everything is alright
     Active,
@@ -69,16 +62,9 @@ pub enum PgState {
     Absent,
     /// This pg on this server is out of date, some pg on other peers has higher version
     Stale,
-}
-
-impl PgInfo {
-    /// Default state is PgState::Inactive
-    pub fn new() -> Self {
-        PgInfo {
-            version: 0,
-            state: PgState::Inactive,
-        }
-    }
+    /// Pg will enter this state when there is a Put request,
+    ///  just forwarding to peers and waiting for their response.
+    Degrade,
 }
 
 #[madsim::service]
@@ -86,7 +72,7 @@ impl<T> ReliableCtl<T>
 where
     T: Store + Sync + Send + 'static,
 {
-    pub fn new(service: T, monitor_client: Arc<ServerClient>) -> Self {
+    pub async fn new(service: T, monitor_client: Arc<ServerClient>) -> Self {
         let (heal_tx, heal_rx) = mpsc::unbounded();
         let ctl = ReliableCtl {
             inner: Arc::new(Mutex::new(Inner::new(service))),
@@ -94,9 +80,20 @@ where
             distributor: Arc::new(SimpleHashDistributor),
             heal_tx,
         };
-        ctl.add_rpc_handler();
-        ctl.start_background_task(heal_rx);
+        ctl.init(heal_rx).await;
         ctl
+    }
+
+    /// 1. initialize pg state: All pgs of responsibility are marked Unprepared and wait for peering procedure
+    /// 2. add rpc handler
+    /// 3. start background procedure
+    async fn init(&self, heal_rx: mpsc::UnboundedReceiver<HealJob>) {
+        let mut inner = self.inner.lock().await;
+        (0..PG_NUM)
+            .filter(|&pgid| self.is_responsible_pg(pgid))
+            .for_each(|pgid| inner.set_pg_state(pgid, PgState::Unprepared));
+        self.add_rpc_handler();
+        self.start_background_task(heal_rx);
     }
 
     fn start_background_task(&self, mut heal_rx: mpsc::UnboundedReceiver<HealJob>) {
@@ -109,10 +106,7 @@ where
         // Peering task
         let this = self.clone();
         task::spawn(async move {
-            loop {
-                this.peering().await;
-                sleep(Duration::from_millis(5000)).await;
-            }
+            this.background_peer().await;
         })
         .detach();
         // Healing task
@@ -132,16 +126,29 @@ where
     #[rpc]
     /// Handler for request directly from client.
     async fn put(&self, request: Put) -> Result<()> {
-        info!("Receive Put from client, key = {}", request.key());
         let pgid = self.distributor.assign_pgid(request.key().as_bytes());
-        self.check_pg_state(pgid).await?;
+        debug!(
+            "Receive Put from client, key = {}, pgid = {}",
+            request.key(),
+            pgid
+        );
+        self.inner.lock().await.check_pg_state(pgid)?;
 
         if self.is_primary(request.key()) {
-            self.forward_put_by_primary(request.clone()).await?;
-            self.inner.lock().await.put(
+            self.inner.lock().await.set_pg_state(pgid, PgState::Degrade);
+            let forward_res = self.forward_put_by_primary(request.clone()).await;
+
+            let mut inner = self.inner.lock().await;
+            if let Err(err) = forward_res {
+                // Error occur when forwarding, conservatively mark it Unprepared.
+                inner.set_pg_state(pgid, PgState::Unprepared);
+                return Err(err);
+            }
+            inner.put(
                 request.key().to_owned(),
                 request.value().unwrap().to_owned(),
             );
+            inner.set_pg_state(pgid, PgState::Active);
             Ok(())
         } else {
             Err(Error::NotPrimary)
@@ -151,9 +158,9 @@ where
     #[rpc]
     /// Handler for get request from client.
     async fn get(&self, request: Get) -> Result<Option<Vec<u8>>> {
-        info!("Receive Get from client, key = {}", request.key());
+        debug!("Receive Get from client, key = {}", request.key());
         let pgid = self.distributor.assign_pgid(request.key().as_bytes());
-        self.check_pg_state(pgid).await?;
+        self.inner.lock().await.check_pg_state(pgid)?;
 
         if self.is_responsible_pg(pgid) {
             Ok(self.inner.lock().await.get(request.key()))
@@ -166,9 +173,13 @@ where
     /// Handler for forward request from primary.
     async fn forward(&self, request: ForwardReq<Put>) -> Result<()> {
         let ForwardReq(request) = request;
-        info!("Get forward put request, key = {}", request.key());
         let pgid = self.distributor.assign_pgid(request.key().as_bytes());
-        self.check_pg_state(pgid).await?;
+        debug!(
+            "Get forward put request, key = {}, pgid = {}",
+            request.key(),
+            pgid
+        );
+        self.inner.lock().await.check_pg_state(pgid)?;
 
         if !self.is_secondary(request.key()) {
             return Err(Error::WrongTarget);
@@ -182,22 +193,22 @@ where
     /// Handler for recover request from peer server.
     async fn recover(&self, request: Recover) -> Result<RecoverRes> {
         let Recover(pgid) = request;
-        self.check_pg_state(pgid).await?;
+        self.inner.lock().await.check_pg_state(pgid)?;
 
         let inner = self.inner.lock().await;
-        let pg_info = inner.get_pg_info(pgid);
+        let pg_ver = inner.get_pg_version(pgid);
         Ok(RecoverRes {
             data: inner.service.get_pg_data(pgid),
-            version: pg_info.version,
+            version: pg_ver,
         })
     }
 
     #[rpc]
-    async fn consult_pg_info(&self, request: ConsultPgInfo) -> HashMap<PgId, PgInfo> {
-        let ConsultPgInfo(pgs) = request;
+    async fn consult_pg_info(&self, request: ConsultPgVersion) -> HashMap<PgId, PgVersion> {
+        let ConsultPgVersion(pgs) = request;
         let inner = self.inner.lock().await;
         pgs.into_iter()
-            .map(|pgid| (pgid, inner.get_pg_info(pgid)))
+            .map(|pgid| (pgid, inner.get_pg_version(pgid)))
             .collect()
     }
 
@@ -205,63 +216,62 @@ where
     async fn heal_job(&self, request: HealJobReq) -> Result<()> {
         let HealJobReq(job) = request;
         let pgid = job.pgid;
-        self.check_pg_state(pgid).await?;
+        self.inner.lock().await.check_pg_state(pgid)?;
         self.heal_tx
             .unbounded_send(job)
             .expect("Send Heal jobs on futures::channel failed");
-        info!("Pg {}'s heal job has been push to queue", pgid);
+        info!("Pg {}'s heal job has been push to the queue", pgid);
         Ok(())
     }
 
     #[rpc]
     async fn heal(&self, request: HealReq) -> Result<()> {
-        let HealReq {
-            pgid,
-            pg_version,
-            data,
-        } = request;
+        let HealReq { pgid, pg_ver, data } = request;
         let mut inner = self.inner.lock().await;
-        let local_pg_version = inner.get_pg_info(pgid).version;
-        if local_pg_version > pg_version {
+        let local_pg_ver = inner.get_pg_version(pgid);
+        if local_pg_ver > pg_ver {
             return Err(Error::PgNotNewer);
+        } else if local_pg_ver == pg_ver {
+            return Ok(());
         }
         inner.service.push_heal_data(pgid, data);
-        inner.update_pg_info(pgid, |mut pg_info| {
-            pg_info.version = pg_version;
-            pg_info.state = PgState::Active;
-            pg_info
-        });
+        inner.set_pg_state(pgid, PgState::Active);
+        inner.set_pg_version(pgid, pg_ver);
         warn!("Pg {} has been healed", pgid);
         Ok(())
     }
 
     async fn forward_put_by_primary(&self, request: Put) -> Result<()> {
-        let mut tasks = FuturesUnordered::new();
-        // 1. Locate the peer servers
+        // locate the peer servers (do not forget to exclude self)
         let peers = self.get_target_addrs(request.key());
         info!("Peers = {:?}", peers);
-        // 2. Send request to peers
-        for peer in peers.into_iter().skip(1) {
-            let request = request.clone();
-            tasks.push(async move {
-                let net = NetLocalHandle::current();
-                for _ in 0..FORWARD_RETRY {
-                    let request = ForwardReq(request.clone());
-                    match net
-                        .call_timeout(peer.to_owned(), request, FORWARD_TIMEOUT)
-                        .await
-                    {
-                        Ok(_) => return Ok(()),
-                        Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-                        Err(err) => return Err(Error::NetworkError(err.to_string())),
+        // prepare request to peers
+        let mut tasks = peers
+            .into_iter()
+            .skip(1)
+            .map(|peer| {
+                let request = request.clone();
+                async move {
+                    let net = NetLocalHandle::current();
+                    for _ in 0..FORWARD_RETRY {
+                        let request = ForwardReq(request.clone());
+                        match net
+                            .call_timeout(peer.to_owned(), request, FORWARD_TIMEOUT)
+                            .await
+                        {
+                            Ok(_) => return Ok(()),
+                            Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
+                            Err(err) => return Err(Error::NetworkError(err.to_string())),
+                        }
                     }
+                    Err(Error::NetworkError(format!(
+                        "Forward Request cannot get response from {}, retry {} times",
+                        peer, FORWARD_RETRY
+                    )))
                 }
-                Err(Error::NetworkError(format!(
-                    "Forward Request cannot get response from {}, retry {} times",
-                    peer, FORWARD_RETRY
-                )))
-            });
-        }
+            })
+            .collect::<FuturesUnordered<_>>();
+
         while let Some(res) = tasks.next().await {
             res?
         }
@@ -303,17 +313,6 @@ where
         let pgid = self.distributor.assign_pgid(key.as_bytes());
         self.distributor.locate(pgid, &self.get_target_map())
     }
-
-    /// Check whether this server can serve `pgid`.
-    async fn check_pg_state(&self, pgid: PgId) -> Result<()> {
-        match self.inner.lock().await.get_pg_info(pgid).state {
-            // TODO: Can stale pg pass checking ?
-            PgState::Active => Ok(()),
-            PgState::Inactive => Err(Error::WrongTarget),
-            // Unprepared, Absent
-            x => Err(Error::PgUnavailable(x)),
-        }
-    }
 }
 
 impl<T> Inner<T>
@@ -324,6 +323,7 @@ where
         let this = Self {
             distributor: Box::new(SimpleHashDistributor::<REPLICA_SIZE>),
             service,
+            pg_states: vec![PgState::Inactive; PG_NUM],
         };
         this
     }
@@ -332,38 +332,55 @@ where
      */
 
     fn put(&mut self, key: String, value: Vec<u8>) {
-        info!("Put {}", key);
         let pgid = self.distributor.assign_pgid(key.as_bytes());
         self.service.put(format!("{}.{}", pgid, key), value);
         // Increment version
-        self.update_pg_info(pgid, |mut pg_info| {
-            pg_info.version += 1;
-            pg_info
-        });
+        self.incr_pg_version(pgid);
+        info!("Put {}, version = {}", key, self.get_pg_version(pgid));
     }
 
     fn get(&mut self, key: &str) -> Option<Vec<u8>> {
-        info!("Get {}", key);
         let pgid = self.distributor.assign_pgid(key.as_bytes());
         self.service.get(&format!("{}.{}", pgid, key))
     }
 
-    fn get_pg_info(&self, pgid: PgId) -> PgInfo {
+    fn get_pg_version(&self, pgid: PgId) -> PgVersion {
         assert!(pgid < PG_NUM);
-        let key = format!("pginfo.{}", pgid);
+        let key = format!("pgver.{}", pgid);
         self.service
             .get(&key)
-            .map(|data| bincode::deserialize(&data).unwrap())
-            .unwrap_or(PgInfo::new())
+            .map(|data| PgVersion::from_be_bytes(data.try_into().unwrap()))
+            .unwrap_or(0)
     }
 
-    fn update_pg_info<F>(&mut self, pgid: PgId, f: F)
-    where
-        F: FnOnce(PgInfo) -> PgInfo,
-    {
-        let updated_pg_info = f(self.get_pg_info(pgid));
-        let key = format!("pginfo.{}", pgid);
-        self.service
-            .put(key, bincode::serialize(&updated_pg_info).unwrap());
+    fn set_pg_version(&mut self, pgid: PgId, version: PgVersion) {
+        let key = format!("pgver.{}", pgid);
+        self.service.put(key, version.to_be_bytes().into());
+    }
+
+    fn incr_pg_version(&mut self, pgid: PgId) {
+        let key = format!("pgver.{}", pgid);
+        let ver = self.get_pg_version(pgid) + 1;
+        self.service.put(key, ver.to_be_bytes().into());
+    }
+
+    fn get_pg_state(&self, pgid: PgId) -> PgState {
+        self.pg_states[pgid]
+    }
+
+    fn set_pg_state(&mut self, pgid: PgId, state: PgState) {
+        self.pg_states[pgid] = state;
+    }
+
+    /// Check whether this server can serve `pgid`.
+    ///
+    /// Only Active can return Ok
+    fn check_pg_state(&self, pgid: PgId) -> Result<()> {
+        match self.get_pg_state(pgid) {
+            PgState::Active => Ok(()),
+            PgState::Inactive => Err(Error::WrongTarget),
+            // Unprepared, Absent, Stale
+            x => Err(Error::PgUnavailable(x)),
+        }
     }
 }

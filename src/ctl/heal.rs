@@ -8,7 +8,7 @@
 //!
 //! We use a mpsc channel to accommodate the HealJob s for each server's healing background procedure.
 
-use super::{PgInfo, PgState, ReliableCtl};
+use super::{PgState, ReliableCtl};
 use crate::constant::HEAL_REQ_TIMEOUT;
 use crate::rpc::HealReq;
 use crate::service::Value;
@@ -53,7 +53,7 @@ where
                 .collect::<Vec<_>>();
             HealReq {
                 pgid,
-                pg_version: inner.get_pg_info(pgid).version,
+                pg_ver: inner.get_pg_version(pgid),
                 data: res,
             }
         };

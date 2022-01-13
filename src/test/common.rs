@@ -156,7 +156,7 @@ impl Client {
     where
         T: KvRequest + Clone,
     {
-        const TIMEOUT: Duration = Duration::from_millis(10_000);
+        const TIMEOUT: Duration = Duration::from_secs(5);
         // Add pgid prefix to the requesting key
         self.handle
             .spawn(async move {
@@ -202,7 +202,13 @@ impl Client {
             let res = self
                 .send_to(crate::rpc::Get(key.to_owned()), target, None)
                 .await;
-            assert!(matches!(res, Ok(Ok(Some(_)))), "Send get to {} get : {:?}", target, res);
+            assert!(
+                matches!(res, Ok(Ok(Some(_)))),
+                "Send get (key = {}) to {} get : {:?}",
+                key,
+                target,
+                res
+            );
             let res = res.unwrap().unwrap().unwrap();
             target_vals.push(res);
         }
@@ -222,8 +228,7 @@ impl KvServerCluster {
         let handle = Handle::current();
         let mut servers = Vec::new();
         for id in 0..server_num {
-            let local_handle = handle.create_host(gen_server_addr(id)).unwrap();
-            handle.net.connect(local_handle.local_addr());
+            handle.create_host(gen_server_addr(id)).unwrap();
         }
         for id in 0..server_num {
             let local_handle = handle.get_host(gen_server_addr(id)).unwrap();
@@ -234,6 +239,7 @@ impl KvServerCluster {
                             KvService::new(),
                             ServerClient::new(id as _, monitor_addr).await.unwrap(),
                         )
+                        .await
                     })
                     .await,
             );
@@ -246,8 +252,7 @@ impl KvServerCluster {
     }
 
     pub async fn restart(&self, idx: usize) {
-        let handle = Handle::current();
-        let local_handle = handle.create_host(gen_server_addr(idx)).unwrap();
+        let local_handle = self.handle.create_host(gen_server_addr(idx)).unwrap();
         local_handle
             .spawn(async move {
                 ReliableCtl::new(
@@ -256,6 +261,7 @@ impl KvServerCluster {
                         .await
                         .unwrap(),
                 )
+                .await
             })
             .await;
     }

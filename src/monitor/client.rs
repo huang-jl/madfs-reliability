@@ -7,6 +7,7 @@ use std::{
     sync::Arc,
     task::{Poll, Waker},
 };
+use log::info;
 
 #[derive(Debug)]
 /// Monitor client used for server
@@ -188,5 +189,11 @@ impl Future for WatchForTargetMap {
             *self.client.watch.lock().unwrap() = Some(cx.waker().clone());
             Poll::Pending
         }
+    }
+}
+
+impl Drop for WatchForTargetMap {
+    fn drop(&mut self) {
+        self.client.watch.lock().unwrap().take();
     }
 }

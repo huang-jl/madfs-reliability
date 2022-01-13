@@ -1,4 +1,6 @@
-use super::{PgInfo, PgState, ReliableCtl};
+use std::time::Duration;
+
+use super::{PgState, ReliableCtl};
 use crate::{
     constant::*,
     rpc::{Recover, RecoverRes},
@@ -6,7 +8,7 @@ use crate::{
     Error, PgId, Result,
 };
 use log::{error, warn};
-use madsim::net::NetLocalHandle;
+use madsim::{net::NetLocalHandle, time::sleep};
 
 impl<T> ReliableCtl<T>
 where
@@ -14,60 +16,42 @@ where
 {
     /// For now: check and recover pgid one by one
     pub(super) async fn background_recovery(&self) {
-        let mut watch_version = self.get_target_map().get_version();
         loop {
-            // wait until target map is updated
-            self.monitor_client
-                .watch_for_target_map(Some(watch_version))
-                .await;
-            // scan each pgid to check whether lacking anyone
             for pgid in (0..PG_NUM)
                 .into_iter()
                 .filter(|&pgid| self.is_responsible_pg(pgid))
             {
-                let local_info = self.inner.lock().await.get_pg_info(pgid);
-                match local_info.state {
-                    PgState::Active => {}
-                    PgState::Absent | PgState::Inactive => {
-                        warn!("Start recovering pg {}", pgid);
-                        if let Err(err) = self.recover_for(pgid).await {
-                            error!("Error occur when recovering pg {}: {}", pgid, err);
-                            continue;
-                        }
-                    }
-                    PgState::Stale | PgState::Unprepared => {
-                        // For now we did not cares about stale or unprepraed state in recovery
+                let pg_state = self.inner.lock().await.get_pg_state(pgid);
+                if pg_state == PgState::Absent {
+                    warn!("Start recovering pg {}", pgid);
+                    if let Err(err) = self.recover_for(pgid).await {
+                        error!("Error occur when recovering pg {}: {}", pgid, err);
+                        continue;
                     }
                 }
             }
-            watch_version = self.get_target_map().get_version();
+            sleep(Duration::from_millis(1500)).await;
         }
     }
 
-    /// For now: asking recovery pg data from primary
+    /// For now: asking recovery pg data from the first server
     async fn recover_for(&self, pgid: PgId) -> Result<()> {
-        // 1. change the state of local pg
-        {
-            let mut inner = self.inner.lock().await;
-            inner.update_pg_info(pgid, |mut pg_info| {
-                pg_info.state = PgState::Absent;
-                pg_info
-            });
-        }
-        // 2. get target address and check responsibility
+        // 1. get target address and check responsibility
         let target_addrs = self.distributor.locate(pgid, &self.get_target_map());
         if !target_addrs.iter().any(|addr| *addr == self.local_addr()) {
             return Err(Error::WrongTarget);
         }
-        // 3. get whole pg data from primary
+        let target_addr = target_addrs
+            .into_iter()
+            .filter(|addr| *addr != self.local_addr())
+            .next()
+            .unwrap();
+        // 2. get whole pg data from the first server
         let net = NetLocalHandle::current();
         let mut response: Option<RecoverRes> = None;
         for _ in 0..RECOVER_RETRY {
             let request = Recover(pgid);
-            match net
-                .call_timeout(target_addrs[0], request, RECOVER_TIMEOUT)
-                .await
-            {
+            match net.call_timeout(target_addr, request, RECOVER_TIMEOUT).await {
                 Ok(res) => response = Some(res?),
                 Err(err) => {
                     warn!("Send Recover request get error: {}", err);
@@ -75,15 +59,13 @@ where
                 }
             }
         }
-        // 3. push pg data into local and update pg_info
+        // 3. push pg data into local and update local pg state and version
         match response {
             Some(RecoverRes { data, version }) => {
                 let mut inner = self.inner.lock().await;
                 inner.service.push_pg_data(pgid, data);
-                inner.update_pg_info(pgid, |_| PgInfo {
-                    state: PgState::Active,
-                    version,
-                });
+                inner.set_pg_state(pgid, PgState::Active);
+                inner.set_pg_version(pgid, version);
                 Ok(())
             }
             None => Err(Error::NetworkError(format!(

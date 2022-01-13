@@ -1,4 +1,6 @@
-use crate::{PgId, PgVersion, Result, TargetMapVersion, ctl::{PgInfo, heal::HealJob}, monitor::*, service::Value};
+use crate::{
+    ctl::heal::HealJob, monitor::*, service::Value, PgId, PgVersion, Result, TargetMapVersion,
+};
 use madsim::{net::rpc::Request, Request};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -27,8 +29,8 @@ where
     T: Request;
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
-#[rtype("HashMap<PgId, PgInfo>")]
-pub struct ConsultPgInfo(pub Vec<PgId>);
+#[rtype("HashMap<PgId, PgVersion>")]
+pub struct ConsultPgVersion(pub Vec<PgId>);
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<()>")]
@@ -40,7 +42,7 @@ pub struct HealJobReq(pub HealJob);
 #[rtype("Result<()>")]
 pub struct HealReq {
     pub pgid: PgId,
-    pub pg_version: PgVersion,
+    pub pg_ver: PgVersion,
     pub data: Vec<(String, Value)>,
 }
 
