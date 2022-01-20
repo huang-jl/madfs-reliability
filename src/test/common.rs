@@ -43,6 +43,7 @@ enum ClientError {
 pub struct KvServerCluster {
     servers: Vec<ReliableCtl<KvService>>,
     handle: Handle,
+    pg_num: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -52,7 +53,7 @@ pub struct Client {
     id: ClientId,
     handle: LocalHandle,
     pub monitor_client: Arc<MonitorClient>,
-    distributor: Box<dyn Distributor<REPLICA_SIZE>>,
+    distributor: Arc<dyn Distributor<REPLICA_SIZE>>,
 }
 
 impl Clone for Client {
@@ -61,7 +62,7 @@ impl Clone for Client {
             id: self.id.clone(),
             handle: self.handle.clone(),
             monitor_client: self.monitor_client.clone(),
-            distributor: Box::new(SimpleHashDistributor::<REPLICA_SIZE>),
+            distributor: self.distributor.clone(),
         }
     }
 }
@@ -115,7 +116,7 @@ impl ClientId {
 }
 
 impl Client {
-    pub fn new(id: u64, monitor_client: Arc<MonitorClient>) -> Self {
+    pub fn new(pg_num: usize, id: u64, monitor_client: Arc<MonitorClient>) -> Self {
         let handle = Handle::current();
         let id = ClientId(id);
         let client_addr = id.to_addr();
@@ -123,7 +124,7 @@ impl Client {
             id,
             handle: handle.create_host(client_addr).unwrap(),
             monitor_client,
-            distributor: Box::new(SimpleHashDistributor),
+            distributor: Arc::new(SimpleHashDistributor::new(pg_num)),
         };
         handle.net.connect(client_addr);
         client
@@ -223,7 +224,7 @@ impl Client {
 }
 
 impl KvServerCluster {
-    pub async fn new(server_num: usize) -> Self {
+    pub async fn new(pg_num: usize, server_num: usize) -> Self {
         let monitor_addr = MONITOR_ADDR.parse().unwrap();
         let handle = Handle::current();
         let mut servers = Vec::new();
@@ -236,6 +237,7 @@ impl KvServerCluster {
                 local_handle
                     .spawn(async move {
                         ReliableCtl::new(
+                            pg_num,
                             KvService::new(),
                             ServerClient::new(id as _, monitor_addr).await.unwrap(),
                         )
@@ -244,7 +246,11 @@ impl KvServerCluster {
                     .await,
             );
         }
-        KvServerCluster { servers, handle }
+        KvServerCluster {
+            servers,
+            handle,
+            pg_num,
+        }
     }
 
     pub fn crash(&self, idx: usize) {
@@ -253,9 +259,11 @@ impl KvServerCluster {
 
     pub async fn restart(&self, idx: usize) {
         let local_handle = self.handle.create_host(gen_server_addr(idx)).unwrap();
+        let pg_num = self.pg_num;
         local_handle
             .spawn(async move {
                 ReliableCtl::new(
+                    pg_num,
                     KvService::new(),
                     ServerClient::new(idx as _, MONITOR_ADDR.parse().unwrap())
                         .await

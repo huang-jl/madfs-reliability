@@ -12,11 +12,6 @@ pub trait Store {
     fn push_pg_data(&mut self, pgid: PgId, data: Vec<u8>);
 
     fn get_key_version(&self, key: &str) -> Option<u64>;
-    /// Get version of all keys in pg `pgid`.
-    /// Return the vector of (key, version) pair inside pg `pgid`.
-    fn get_heal_data(&self, pgid: PgId) -> Vec<(String, u64)>;
-    /// Push the updated (key, value) pair from `data` into pg `pgid`.
-    fn push_heal_data(&mut self, pgid: PgId, data: Vec<(String, Value)>);
     fn snapshot(&self) -> Vec<u8>;
     fn install(&mut self, snapshot: Vec<u8>);
 }
@@ -81,25 +76,25 @@ impl Store for KvService {
         self.kv.get(key).map(|value| value.version)
     }
 
-    fn get_heal_data(&self, pgid: PgId) -> Vec<(String, u64)> {
-        self.kv
-            .range(
-                pgid.to_string() + "."
-                    ..(pgid).to_string() + &format!("{}", ('.' as u8 + 1) as char),
-            )
-            .map(|(k, v)| (k.clone(), v.version))
-            .collect()
-    }
+    // fn get_heal_data(&self, pgid: PgId) -> Vec<(String, u64)> {
+    //     self.kv
+    //         .range(
+    //             pgid.to_string() + "."
+    //                 ..(pgid).to_string() + &format!("{}", ('.' as u8 + 1) as char),
+    //         )
+    //         .map(|(k, v)| (k.clone(), v.version))
+    //         .collect()
+    // }
 
-    fn push_heal_data(&mut self, pgid: PgId, data: Vec<(String, Value)>) {
-        for (key, value) in data {
-            assert_eq!(
-                key.split(".").next().unwrap().parse::<PgId>().unwrap(),
-                pgid
-            );
-            self.kv.insert(key, value);
-        }
-    }
+    // fn push_heal_data(&mut self, pgid: PgId, data: Vec<(String, Value)>) {
+    //     for (key, value) in data {
+    //         assert_eq!(
+    //             key.split(".").next().unwrap().parse::<PgId>().unwrap(),
+    //             pgid
+    //         );
+    //         self.kv.insert(key, value);
+    //     }
+    // }
 
     fn snapshot(&self) -> Vec<u8> {
         bincode::serialize(&self.kv).unwrap()
@@ -124,15 +119,17 @@ mod test {
 
     use super::{KvService, Store, Value};
     use crate::{
-        constant::{PG_NUM, REPLICA_SIZE},
+        constant::REPLICA_SIZE,
         distributor::{Distributor, SimpleHashDistributor},
         test::common::gen_random_put,
     };
 
     #[test]
     fn test_pgid() {
+        const PG_NUM: usize = 256;
+
         let mut service = KvService::new();
-        let distributor = SimpleHashDistributor::<REPLICA_SIZE>;
+        let distributor = SimpleHashDistributor::<REPLICA_SIZE>::new(PG_NUM);
         let mut golden: Vec<BTreeMap<String, Vec<u8>>> = vec![BTreeMap::new(); PG_NUM];
         for _ in 0..5000 {
             let (k, v) = gen_random_put(3, 10);

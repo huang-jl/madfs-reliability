@@ -1,14 +1,15 @@
-use crate::{
-    ctl::heal::HealJob, monitor::*, service::Value, PgId, PgVersion, Result, TargetMapVersion,
-};
+use crate::{monitor::*, PgId, PgVersion, Result, TargetMapVersion};
 use madsim::{net::rpc::Request, Request};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
 pub trait KvRequest: Request {
     fn key(&self) -> &str;
     fn value(&self) -> Option<&[u8]>;
     fn take(self) -> (Option<String>, Option<Vec<u8>>);
+}
+
+pub trait EpochRequest {
+    fn epoch(&self) -> TargetMapVersion;
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
@@ -23,27 +24,38 @@ pub struct Put {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
-#[rtype("<T as Request>::Response")]
-pub struct ForwardReq<T>(#[serde(bound(deserialize = ""))] pub T)
-where
-    T: Request;
+#[rtype("Result<()>")]
+pub struct ForwardReq {
+    pub id: u64,
+    pub op: Put,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
-#[rtype("HashMap<PgId, PgVersion>")]
-pub struct ConsultPgVersion(pub Vec<PgId>);
+#[rtype("Result<PgVersion>")]
+pub struct PeerConsult {
+    pub epoch: TargetMapVersion,
+    pub pgid: PgId,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<()>")]
-/// When some server find its local pg is stale, it will send this kind of request to the up-to-date server.
-/// The up-to-date server will add `HealJob` to its healing procedure queue.
-pub struct HealJobReq(pub HealJob);
+pub struct PeerFinish {
+    pub epoch: TargetMapVersion,
+    pub pgid: PgId,
+    pub logs: Vec<(u64, Put)>,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
-#[rtype("Result<()>")]
+#[rtype("Result<Vec<(u64, Put)>>")]
 pub struct HealReq {
     pub pgid: PgId,
     pub pg_ver: PgVersion,
-    pub data: Vec<(String, Value)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[rtype("Result<()>")]
+pub struct PgHeartbeat {
+    pub pgid: PgId,
 }
 
 impl KvRequest for Get {
@@ -74,6 +86,18 @@ impl KvRequest for Put {
     }
 }
 
+impl EpochRequest for PeerConsult {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
+impl EpochRequest for PeerFinish {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
 // Monitor related
 
 #[derive(Debug, Serialize, Deserialize, Request)]
@@ -82,6 +106,7 @@ pub struct FetchTargetMapReq(pub Option<TargetMapVersion>);
 
 #[derive(Debug, Serialize, Deserialize, Request)]
 #[rtype("HeartBeatRes")]
+/// Heartbeat used for monitor
 pub struct HeartBeat {
     pub target_map_version: TargetMapVersion,
     pub target_info: TargetInfo,
@@ -90,14 +115,4 @@ pub struct HeartBeat {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct HeartBeatRes {
     pub target_map: Option<TargetMap>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Request)]
-#[rtype("Result<RecoverRes>")]
-pub struct Recover(pub PgId);
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RecoverRes {
-    pub data: Vec<u8>,
-    pub version: PgVersion,
 }

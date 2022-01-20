@@ -16,7 +16,6 @@ mod constant {
 
     pub const REPLICA_SIZE: usize = 3;
     pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
-    pub const PG_NUM: usize = 256;
     pub const FILE_PATH: &str = "service.blob";
 
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -32,10 +31,11 @@ mod constant {
     pub const RECOVER_RETRY: u32 = 3;
 
     /// Timeout of peering request
-    pub const CONSULT_TIMEOUT: Duration = Duration::from_millis(500);
+    pub const PEER_TIMEOUT: Duration = Duration::from_millis(500);
+
+    pub const PG_HEARTBEAT_TIMEOUT: Duration = Duration::from_millis(500);
 
     pub const HEAL_REQ_TIMEOUT: Duration = Duration::from_millis(3000);
-    pub const HEAL_JOB_REQ_TIMEOUT: Duration = Duration::from_millis(1500);
 }
 
 pub type PgId = usize;
@@ -57,6 +57,8 @@ pub enum Error {
     PgUnavailable(PgState),
     #[error("The pg is not more up-to-date")]
     PgNotNewer, // Used when find peers send some pg which is not more up-to-date during healing
+    #[error("The epoch is too old, try to update TargetMap from Monitor")]
+    StaleEpoch,
 }
 
 impl From<std::io::Error> for Error {

@@ -1,4 +1,3 @@
-use crate::constant::PG_NUM;
 use crate::{monitor::TargetMap, PgId};
 use ahash::AHasher;
 use std::{
@@ -12,7 +11,16 @@ pub trait Distributor<const REPLICA_SIZE: usize>: Send + Sync {
 }
 
 #[derive(Debug)]
-pub struct SimpleHashDistributor<const N: usize>;
+pub struct SimpleHashDistributor<const N: usize> {
+    pg_num: usize,
+}
+
+impl<const N: usize> SimpleHashDistributor<N> {
+    pub fn new(pg_num: usize) -> Self {
+        assert_eq!(pg_num & (pg_num - 1), 0);
+        Self { pg_num }
+    }
+}
 
 impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {
     fn locate(&self, pgid: PgId, target_map: &TargetMap) -> [SocketAddr; N] {
@@ -20,7 +28,7 @@ impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {
         let mut start = 0;
         let mut count = 0;
         while count < N {
-            let mut hasher = AHasher::default();
+            let mut hasher = AHasher::new_with_keys(0xdead, 0xbeaf);
             pgid.hash(&mut hasher);
             start.hash(&mut hasher);
             let host_id = hasher.finish() as usize % target_map.len();
@@ -29,11 +37,10 @@ impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {
             // 1. Check if target is active
             // 2. Check if host is duplicated
             if target_map.map[host_id].is_active()
-                && ans
+                && !ans
                     .iter()
                     .filter(|item| item.is_some())
-                    .find(|item| **item == target_map.map[host_id].get_addr())
-                    .is_none()
+                    .any(|item| *item == target_map.map[host_id].get_addr())
             {
                 ans[count] = target_map.map[host_id].get_addr();
                 count += 1;
@@ -48,22 +55,26 @@ impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {
     }
 
     fn assign_pgid(&self, key: &[u8]) -> PgId {
-        assert_eq!(PG_NUM & (PG_NUM - 1), 0);
         let mut hasher = AHasher::default();
         key.hash(&mut hasher);
-        hasher.finish() as usize & (PG_NUM - 1)
+        hasher.finish() as usize & (self.pg_num - 1)
     }
 }
 
 #[cfg(test)]
 mod test {
-    use crate::constant::{PG_NUM, REPLICA_SIZE};
+    use crate::constant::REPLICA_SIZE;
     use crate::distributor::{Distributor, SimpleHashDistributor};
     use crate::monitor::{TargetInfo, TargetMap, TargetState};
     use crate::test::common::*;
+    use crate::PgId;
     use rand::{seq::SliceRandom, thread_rng};
 
-    fn init(server_num: usize, shuffle: bool) -> (TargetMap, SimpleHashDistributor<REPLICA_SIZE>) {
+    fn init(
+        pg_num: usize,
+        server_num: usize,
+        shuffle: bool,
+    ) -> (TargetMap, SimpleHashDistributor<REPLICA_SIZE>) {
         let mut target_map = TargetMap::empty();
         target_map.map = (0..server_num)
             .map(|id| match id % 4 {
@@ -79,12 +90,16 @@ mod test {
             target_map.map.shuffle(&mut thread_rng());
         }
 
-        (target_map, SimpleHashDistributor::<REPLICA_SIZE>)
+        (
+            target_map,
+            SimpleHashDistributor::<REPLICA_SIZE>::new(pg_num),
+        )
     }
 
     #[test]
     fn correct_location() {
-        let (target_map, distributor) = init(100, true);
+        const PG_NUM: usize = 256;
+        let (target_map, distributor) = init(PG_NUM, 100, true);
 
         for pgid in 0..PG_NUM {
             let mut target_addrs = distributor.locate(pgid, &target_map);
@@ -110,9 +125,10 @@ mod test {
     #[test]
     fn deterministic() {
         const TIMES: usize = 256;
+        const PG_NUM: usize = 256;
         for _ in 0..TIMES {
             let pgid = rand::random();
-            let (target_map, distributor) = init(100, true);
+            let (target_map, distributor) = init(PG_NUM, 100, true);
             let target_addrs = distributor.locate(pgid, &target_map);
             for _ in 0..10 {
                 let target_addrs2 = distributor.locate(pgid, &target_map);

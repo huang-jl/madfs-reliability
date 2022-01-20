@@ -1,13 +1,13 @@
 use super::{TargetInfo, TargetMap, TargetMapVersion, TargetState};
 use crate::{constant::*, rpc::*, Error, Result};
 use futures::Future;
+use log::info;
 use madsim::{net::NetLocalHandle, task, time::sleep};
 use std::{
     net::SocketAddr,
     sync::Arc,
     task::{Poll, Waker},
 };
-use log::info;
 
 #[derive(Debug)]
 /// Monitor client used for server
@@ -71,14 +71,7 @@ impl ServerClient {
                     target_map: Some(updated_map),
                 }) => {
                     // check if the piggy-backed map is more up-to-date
-                    let mut local_map = self.target_map.lock().unwrap();
-                    if local_map.get_version() < updated_map.get_version() {
-                        *local_map = updated_map;
-                        // call waker to wake up the task
-                        if let Some(waker) = self.watch.lock().unwrap().take() {
-                            waker.wake();
-                        }
-                    }
+                    self._update_target_map(updated_map);
                 }
                 Ok(_) => {}
                 Err(err) => panic!("Error occur at server heartbeat with monitor: {:?}", err),
@@ -113,9 +106,17 @@ impl ServerClient {
 
     pub async fn update_target_map(&self) {
         let updated_map = self.fetch_target_map(None).await.unwrap();
+        self._update_target_map(updated_map);
+    }
+
+    /// Check whether `new_map`'s version is greater than local map version,
+    /// and try to update it.
+    /// 
+    /// By the way, it will wake the `WatchForTargetMap` Futures.
+    fn _update_target_map(&self, new_map: TargetMap) {
         let mut local_map = self.target_map.lock().unwrap();
-        if local_map.get_version() < updated_map.get_version() {
-            *local_map = updated_map;
+        if local_map.get_version() < new_map.get_version() {
+            *local_map = new_map;
             // call waker to wake up the task
             if let Some(waker) = self.watch.lock().unwrap().take() {
                 waker.wake();

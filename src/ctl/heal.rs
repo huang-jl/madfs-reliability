@@ -1,67 +1,78 @@
-//! Healing procedure is guided by the most up-to-date server instead of the laggy server.
-//! Because the laggy server may lose some [Put](crate::rpc::Put) request,
-//!  and there is no way for it to find those keys.
-//!
-//! The solution is when laggy server detect stale pgs by peering procedure, then
-//! it will send heal jobs to the most up-to-date server.
-//! Then this up-to-date server start handling the healing job one by one.
-//!
-//! We use a mpsc channel to accommodate the HealJob s for each server's healing background procedure.
+//! When peering procedure detect there is lag between local pg version and peers' pg version,
+//! server will send Heal request to the most up-to-date server. The most up-to-date server will
+//! response with the missing logs.
 
-use super::{PgState, ReliableCtl};
+use super::{Error, PgState, ReliableCtl, Result};
 use crate::constant::HEAL_REQ_TIMEOUT;
-use crate::rpc::HealReq;
-use crate::service::Value;
+use crate::rpc::{HealReq, KvRequest};
 use crate::{service::Store, PgId};
-use log::warn;
+use futures::stream::{FuturesUnordered, StreamExt};
+use log::{debug, error};
 use madsim::net::NetLocalHandle;
-use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use madsim::time::sleep;
 use std::net::SocketAddr;
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct HealJob {
-    pub pgid: PgId,
-    pub addr: SocketAddr,
-    pub keys: Vec<(String, u64)>,
-}
+use std::time::Duration;
 
 impl<T> ReliableCtl<T>
 where
     T: Store + Sync + Send + 'static,
 {
-    // Healing the stale pg by scanning all keys and get the latest version from peers
-    pub(super) async fn heal_for(&self, job: HealJob) {
-        let HealJob { pgid, addr, keys } = job;
-        let keys = keys.into_iter().collect::<HashMap<_, _>>();
-        let request = {
-            let inner = self.inner.lock().await;
-            let local_keys = inner.service.get_heal_data(pgid);
-            // Only keep those in `local_keys`:
-            // 1. do not exist in `keys`
-            // 2. version is greater than version in `keys`
-            let res = local_keys
-                .into_iter()
-                .filter(|(key, local_ver)| keys.get(key).map_or(true, |ver| local_ver > ver))
-                .map(|(key, ver)| {
-                    let value = Value {
-                        data: inner.service.get(&key).unwrap(),
-                        version: ver,
-                    };
-                    (key, value)
+    pub(super) async fn background_heal(&self) {
+        loop {
+            let mut heal_tasks = self
+                .inner
+                .pgs
+                .lock()
+                .await
+                .iter()
+                .filter(|(_, info)| info.state == PgState::Inconsistent)
+                .map(|x| {
+                    let this = self.clone();
+                    let target_map = self.get_target_map();
+                    let pgid = *x.0;
+                    async move { (pgid, this.peer_for(pgid, &target_map).await) }
                 })
-                .collect::<Vec<_>>();
-            HealReq {
-                pgid,
-                pg_ver: inner.get_pg_version(pgid),
-                data: res,
+                .collect::<FuturesUnordered<_>>();
+            while let Some((pgid, res)) = heal_tasks.next().await {
+                if let Err(err) = res {
+                    error!("Error occuring when healing pg {}: {}", pgid, err);
+                }
             }
+            sleep(Duration::from_secs(2)).await;
+        }
+    }
+
+    // send heal request to `target_addr` and get the latest log
+    pub(super) async fn heal_for(&self, pgid: PgId, target_addr: SocketAddr) -> Result<()> {
+        let request = HealReq {
+            pgid,
+            pg_ver: self.inner.get_pg_version(pgid),
         };
         let net = NetLocalHandle::current();
-        match net.call_timeout(addr, request, HEAL_REQ_TIMEOUT).await {
-            Err(err) => warn!("Send Heal Request to {} get error: {}", addr, err),
-            Ok(Err(err)) => warn!("Send Heal Request to {} get error: {}", addr, err),
-            _ => {}
+        match net
+            .call_timeout(target_addr, request.clone(), HEAL_REQ_TIMEOUT)
+            .await
+        {
+            Ok(Ok(res)) => {
+                let curr_ver = self.inner.get_pg_version(pgid);
+                let mut res = res
+                    .into_iter()
+                    .filter(|(log_id, _)| *log_id >= curr_ver)
+                    .collect::<Vec<_>>();
+                res.sort_by(|a, b| a.0.cmp(&b.0));
+                for (id, op) in res {
+                    self.inner.add_log(id, &op).await;
+                    self.inner.apply_log(pgid, id).await;
+                }
+                debug!(
+                    "Heal for pg {}, current version = {}",
+                    pgid,
+                    self.inner.get_pg_version(pgid)
+                );
+                Ok(())
+            }
+            Ok(Err(err)) => Err(err),
+            Err(err) => Err(Error::from(err)),
         }
     }
 }

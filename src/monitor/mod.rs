@@ -1,5 +1,5 @@
 use crate::{constant::*, rpc::*, Error, Result, TargetMapVersion};
-use log::{info, warn};
+use log::{debug, info, warn};
 use madsim::{
     task,
     time::{sleep, Instant},
@@ -62,7 +62,6 @@ pub enum TargetState {
     DownOut,
 }
 
-
 #[madsim::service]
 impl Monitor {
     pub fn new(pg_num: usize, server_addrs: Vec<SocketAddr>) -> Self {
@@ -82,7 +81,7 @@ impl Monitor {
 
     #[rpc]
     async fn heartbeat(&self, request: HeartBeat) -> HeartBeatRes {
-        info!(
+        debug!(
             "Receive heartbeat from {} ({:?})",
             request.target_info.id,
             request.target_info.get_addr()
@@ -108,9 +107,12 @@ impl Inner {
     fn new(pg_num: usize, server_addrs: Vec<SocketAddr>) -> Self {
         Inner {
             heartbeat: (0..server_addrs.len()).map(|_| Instant::now()).collect(),
-            target_map: [(0, TargetMap::empty()), (1, TargetMap::init(server_addrs.clone()))]
-                .into_iter()
-                .collect(),
+            target_map: [
+                (0, TargetMap::empty()),
+                (1, TargetMap::init(server_addrs.clone())),
+            ]
+            .into_iter()
+            .collect(),
             addrs: server_addrs,
         }
     }
@@ -133,9 +135,7 @@ impl Inner {
         self.heartbeat[target_id] = Instant::now();
 
         // Piggy back updated map
-        let mut res = HeartBeatRes {
-            target_map: None,
-        };
+        let mut res = HeartBeatRes { target_map: None };
         if request.target_map_version < self.get_lastest_target_map_version() {
             res.target_map = Some(self.get_target_map(None).unwrap());
         }
@@ -173,13 +173,18 @@ impl Inner {
                     update = true;
                 }
             });
-        target_map.map.iter_mut().enumerate().filter(|(_, info)| info.is_down()).for_each(|(id, target_info)|{
-            if self.heartbeat[id].elapsed() < DOWN_TIMEOUT {
-                info!("Target {} has been marked down but restart now", id);
-                target_info.state = TargetState::UpIn(self.addrs[id]);
-                update = true;
-            }
-        });
+        target_map
+            .map
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, info)| info.is_down())
+            .for_each(|(id, target_info)| {
+                if self.heartbeat[id].elapsed() < DOWN_TIMEOUT {
+                    info!("Target {} has been marked down but restart now", id);
+                    target_info.state = TargetState::UpIn(self.addrs[id]);
+                    update = true;
+                }
+            });
         if update {
             target_map.version += 1;
             self.target_map.insert(target_map.version, target_map);
