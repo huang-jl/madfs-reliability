@@ -4,7 +4,7 @@
 
 use super::{Error, PgState, ReliableCtl, Result};
 use crate::constant::HEAL_REQ_TIMEOUT;
-use crate::rpc::{HealReq, KvRequest};
+use crate::rpc::HealReq;
 use crate::{service::Store, PgId};
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::{debug, error};

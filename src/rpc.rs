@@ -1,3 +1,5 @@
+use std::fmt::Display;
+
 use crate::{monitor::*, PgId, PgVersion, Result, TargetMapVersion};
 use madsim::{net::rpc::Request, Request};
 use serde::{Deserialize, Serialize};
@@ -37,7 +39,7 @@ pub struct PeerConsult {
     pub pgid: PgId,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[derive(Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<()>")]
 pub struct PeerFinish {
     pub epoch: TargetMapVersion,
@@ -95,6 +97,18 @@ impl EpochRequest for PeerConsult {
 impl EpochRequest for PeerFinish {
     fn epoch(&self) -> TargetMapVersion {
         self.epoch
+    }
+}
+
+impl Display for PeerFinish {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "PeerFinish {{\npgid: {}, epoch: {}, log length: {}}}",
+            self.pgid,
+            self.epoch,
+            self.logs.len()
+        )
     }
 }
 

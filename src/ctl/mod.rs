@@ -12,7 +12,7 @@ use log::{debug, error, info, warn};
 use madsim::{net::NetLocalHandle, task, time::Instant};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::{btree_map::Entry, HashMap},
+    collections::HashMap,
     fmt::Debug,
     io,
     net::SocketAddr,
@@ -235,7 +235,7 @@ where
 
     #[rpc]
     async fn peer_finish(&self, request: PeerFinish) -> Result<()> {
-        debug!("Get peer finish request: {:?}", request);
+        debug!("Get peer finish request: {}", request);
         let PeerFinish {
             pgid,
             mut logs,

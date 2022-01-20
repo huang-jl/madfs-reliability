@@ -17,11 +17,12 @@ where
     /// then mark this pg Inactive.
     pub(super) async fn heartbeat(&self) {
         loop {
+            sleep(Duration::from_secs(1)).await;
+
             let mut pgs = self.inner.pgs.lock().await;
             pgs.iter_mut()
                 .filter(|(_, info)| {
-                    !info.primary
-                        && info.state == PgState::Active
+                    info.state == PgState::Active
                         && info
                             .heartbeat_ts
                             .map_or(true, |t| t.elapsed() > Duration::from_secs(3))
@@ -52,7 +53,6 @@ where
                     error!("Error occuring when heartbeat pg {}: {}", pgid, err);
                 }
             }
-            sleep(Duration::from_secs(1)).await;
         }
     }
 
@@ -65,22 +65,21 @@ where
             .map(|addr| {
                 let net = NetLocalHandle::current();
                 async move {
-                    net.call_timeout(addr, PgHeartbeat { pgid }, PG_HEARTBEAT_TIMEOUT)
-                        .await
+                    (
+                        addr,
+                        net.call_timeout(addr, PgHeartbeat { pgid }, PG_HEARTBEAT_TIMEOUT)
+                            .await,
+                    )
                 }
             })
-            .collect::<FuturesOrdered<_>>()
-            .enumerate();
-        while let Some((idx, res)) = requests.next().await {
+            .collect::<FuturesOrdered<_>>();
+        while let Some((addr, res)) = requests.next().await {
             if matches!(res, Err(_) | Ok(Err(_))) {
-                warn!(
-                    "Heartbeat pg {} with {} get: {:?}",
-                    pgid, target_addrs[idx], res
-                );
+                warn!("Heartbeat pg {} with {} get: {:?}", pgid, addr, res);
             }
             res??;
-            self.inner.update_pg_heartbeat_ts(pgid).await;
         }
+        self.inner.update_pg_heartbeat_ts(pgid).await;
         Ok(())
     }
 }

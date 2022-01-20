@@ -78,57 +78,52 @@ async fn one_pg_crash_and_up() {
     // Put some random keys
     for _ in 0..500 {
         let (key, value) = gen_random_put(5, 10);
-        golden.insert(key.clone(), vec![value.clone()]);
+        golden
+            .entry(key.clone())
+            .and_modify(|v: &mut Vec<Vec<u8>>| v.push(value.clone()))
+            .or_insert(vec![value.clone()]);
         let request = Put { key, value };
 
         let res = client.send(request.clone(), None).await;
         assert!(matches!(res, Ok(Ok(_))));
     }
 
-    // Find the keys which are stored on CRASH server
-    let mut keys = Vec::new();
-    for key in golden.keys() {
-        if client
-            .get_target_addrs(key.as_bytes())
-            .await
-            .iter()
-            .any(|addr| *addr == gen_server_addr(CRASH_TARGET_IDX))
-        {
-            keys.push(key.to_owned());
-        }
-    }
-
     cluster.crash(CRASH_TARGET_IDX);
     warn!("Server crash!");
-    sleep(Duration::from_secs(25)).await;
-    client.update_target_map().await;
-
-    let (key, value) = gen_random_put(5, 10);
-    warn!("random gen {:?}", gen_random_put(5, 10));
-    let request = Put {
-        key: key,
-        value: value,
-    };
-    let res = client.send(request, None).await;
-    assert!(matches!(res, Ok(Err(_)) | Err(_)), "send put get {:?}", res);
-
     // Make sure all keys is unavaiable right after the server is crash
     let mut tasks = FuturesUnordered::new();
-    for key in golden.keys() {
-        let target = client.get_target_addrs(key.as_bytes()).await;
-        target.into_iter().for_each(|target_addr| {
-            let c = client.clone();
-            let request = Get(key.clone());
-            tasks.push(async move { c.send_to(request, target_addr, None).await })
-        });
+    for (key, v) in golden.iter_mut() {
+        let (_, value) = gen_random_put(5, 10);
+        v.push(value.clone());
+        let request = Put {
+            key: key.clone(),
+            value,
+        };
+        let c = client.clone();
+        tasks.push(async move { c.send(request, None).await });
     }
     while let Some(res) = tasks.next().await {
-        assert!(matches!(res, Ok(Err(_))))
+        assert!(matches!(res, Ok(Err(_)) | Err(_)))
+    }
+
+    sleep(Duration::from_secs(10)).await;
+
+    // Add more keys
+    for _ in 0..50 {
+        let (key, value) = gen_random_put(5, 10);
+        golden
+            .entry(key.clone())
+            .and_modify(|v: &mut Vec<Vec<u8>>| v.push(value.clone()))
+            .or_insert(vec![value.clone()]);
+        let request = Put { key, value };
+
+        let res = client.send(request.clone(), None).await;
+        assert!(matches!(res, Ok(Ok(_))));
     }
 
     cluster.restart(CRASH_TARGET_IDX).await;
     warn!("Server restart!");
-    sleep(Duration::from_secs(25)).await;
+    sleep(Duration::from_secs(10)).await;
     client.update_target_map().await;
 
     for (key, value) in golden.iter() {
