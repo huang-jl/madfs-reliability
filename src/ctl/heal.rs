@@ -47,6 +47,7 @@ where
         let request = HealReq {
             pgid,
             pg_ver: self.inner.get_pg_version(pgid),
+            epoch: self.get_epoch(),
         };
         let net = NetLocalHandle::current();
         match net

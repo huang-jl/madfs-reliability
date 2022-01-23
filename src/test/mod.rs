@@ -39,7 +39,11 @@ async fn cluster_simple_test() {
     for _ in 0..1000 {
         let (key, value) = gen_random_put(10, 20);
         golden.insert(key.clone(), value.clone());
-        let request = Put { key, value };
+        let request = Put {
+            key,
+            value,
+            epoch: client.get_epoch(),
+        };
 
         let res = client.send(request.clone(), None).await;
         assert!(matches!(res, Ok(Ok(_))));
@@ -82,7 +86,11 @@ async fn one_pg_crash_and_up() {
             .entry(key.clone())
             .and_modify(|v: &mut Vec<Vec<u8>>| v.push(value.clone()))
             .or_insert(vec![value.clone()]);
-        let request = Put { key, value };
+        let request = Put {
+            key,
+            value,
+            epoch: client.get_epoch(),
+        };
 
         let res = client.send(request.clone(), None).await;
         assert!(matches!(res, Ok(Ok(_))));
@@ -98,6 +106,7 @@ async fn one_pg_crash_and_up() {
         let request = Put {
             key: key.clone(),
             value,
+            epoch: client.get_epoch(),
         };
         let c = client.clone();
         tasks.push(async move { c.send(request, None).await });
@@ -115,7 +124,11 @@ async fn one_pg_crash_and_up() {
             .entry(key.clone())
             .and_modify(|v: &mut Vec<Vec<u8>>| v.push(value.clone()))
             .or_insert(vec![value.clone()]);
-        let request = Put { key, value };
+        let request = Put {
+            key,
+            value,
+            epoch: client.get_epoch(),
+        };
 
         let res = client.send(request.clone(), None).await;
         assert!(matches!(res, Ok(Ok(_))));
@@ -158,7 +171,11 @@ async fn crash_and_up() {
     for _ in 0..3000 {
         let (key, value) = gen_random_put(5, 10);
         golden.insert(key.clone(), vec![value.clone()]);
-        let request = Put { key, value };
+        let request = Put {
+            key,
+            value,
+            epoch: client.get_epoch(),
+        };
 
         let res = client.send(request.clone(), None).await;
         assert!(

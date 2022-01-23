@@ -16,13 +16,17 @@ pub trait EpochRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<Option<Vec<u8>>>")]
-pub struct Get(pub String);
+pub struct Get {
+    pub epoch: TargetMapVersion,
+    pub key: String,
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<()>")]
 pub struct Put {
     pub key: String,
     pub value: Vec<u8>,
+    pub epoch: TargetMapVersion,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
@@ -30,6 +34,7 @@ pub struct Put {
 pub struct ForwardReq {
     pub id: u64,
     pub op: Put,
+    pub epoch: TargetMapVersion,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
@@ -52,17 +57,19 @@ pub struct PeerFinish {
 pub struct HealReq {
     pub pgid: PgId,
     pub pg_ver: PgVersion,
+    pub epoch: TargetMapVersion,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<()>")]
 pub struct PgHeartbeat {
     pub pgid: PgId,
+    pub epoch: TargetMapVersion,
 }
 
 impl KvRequest for Get {
     fn key(&self) -> &str {
-        &self.0
+        &self.key
     }
 
     fn value(&self) -> Option<&[u8]> {
@@ -70,7 +77,7 @@ impl KvRequest for Get {
     }
 
     fn take(self) -> (Option<String>, Option<Vec<u8>>) {
-        (Some(self.0), None)
+        (Some(self.key), None)
     }
 }
 
@@ -100,11 +107,41 @@ impl EpochRequest for PeerFinish {
     }
 }
 
+impl EpochRequest for Get {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
+impl EpochRequest for Put {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
+impl EpochRequest for ForwardReq {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
+impl EpochRequest for HealReq {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
+impl EpochRequest for PgHeartbeat {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
 impl Display for PeerFinish {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PeerFinish {{\npgid: {}, epoch: {}, log length: {}}}",
+            "PeerFinish {{ pgid: {}, epoch: {}, log length: {} }}",
             self.pgid,
             self.epoch,
             self.logs.len()

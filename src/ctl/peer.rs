@@ -72,6 +72,14 @@ where
             while let Some((pgid, res)) = peer_tasks.next().await {
                 if let Err(err) = res {
                     error!("Error occur when peering pg {}: {}", pgid, err);
+                    // Later try to heal it
+                    self.inner.set_pg_state(pgid, PgState::Inconsistent).await;
+                } else {
+                    debug!(
+                        "Finish peering pg {} in epoch {}",
+                        pgid,
+                        target_map.get_version()
+                    );
                 }
             }
             select! {
@@ -89,7 +97,6 @@ where
     /// 1. Primary should call this when cluster map changes before pg can start serving.
     /// 2. Primary can call this to bring the damaged pg recovered.
     pub(super) async fn peer_for(&self, pgid: PgId, target_map: &TargetMap) -> Result<()> {
-        assert!(self.is_responsible_pg(pgid));
         // collect pg version
         let (peers, peer_res) = self.collect_pg_ver(pgid, target_map).await?;
         // if peer has higher version then heal it (makes it up-to-date)

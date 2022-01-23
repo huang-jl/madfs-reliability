@@ -3,7 +3,10 @@ use crate::{
     constant::*,
     distributor::{Distributor, SimpleHashDistributor},
     monitor::{client::ServerClient, TargetMap},
-    rpc::{ForwardReq, Get, HealReq, KvRequest, PeerConsult, PeerFinish, PgHeartbeat, Put},
+    rpc::{
+        EpochRequest, ForwardReq, Get, HealReq, KvRequest, PeerConsult, PeerFinish, PgHeartbeat,
+        Put,
+    },
     service::Store,
     Error, PgId, PgVersion, Result, TargetMapVersion,
 };
@@ -148,7 +151,7 @@ where
         );
         self.inner.check_pg_state(pgid).await?;
 
-        if self.is_primary(request.key()) {
+        if self.inner.is_primary(pgid).await {
             let op_id = self.inner.assign_log_id(pgid);
             let forward_res = self.forward_put_by_primary(&request, op_id).await;
 
@@ -175,10 +178,11 @@ where
     /// Handler for get request from client.
     async fn get(&self, request: Get) -> Result<Option<Vec<u8>>> {
         debug!("Receive Get from client, key = {}", request.key());
+        self.check_epoch(&request)?;
         let pgid = self.distributor.assign_pgid(request.key().as_bytes());
         self.inner.check_pg_state(pgid).await?;
 
-        if self.is_responsible_pg(pgid) {
+        if self.inner.is_responsible(pgid).await {
             Ok(self.inner.get(request.key()).await)
         } else {
             Err(Error::WrongTarget)
@@ -188,7 +192,8 @@ where
     #[rpc]
     /// Handler for forward request from primary.
     async fn forward(&self, request: ForwardReq) -> Result<()> {
-        let ForwardReq { id, op } = request;
+        self.check_epoch(&request)?;
+        let ForwardReq { id, op, .. } = request;
         let pgid = self.distributor.assign_pgid(op.key().as_bytes());
         debug!(
             "Get forward put request, key = {}, pgid = {}",
@@ -197,7 +202,7 @@ where
         );
         self.inner.check_pg_state(pgid).await?;
 
-        if !self.is_secondary(op.key()) {
+        if !self.inner.is_secondary(pgid).await {
             return Err(Error::WrongTarget);
         }
         self.inner.add_log(id, &op).await;
@@ -209,8 +214,15 @@ where
     async fn peer_consult(&self, request: PeerConsult) -> Result<PgVersion> {
         debug!("Get peer consult request: {:?}", request);
         let PeerConsult { pgid, epoch } = request;
-        if epoch < self.get_epoch() {
-            return Err(Error::StaleEpoch);
+        let local_epoch = self.get_epoch();
+        if epoch < local_epoch {
+            return Err(Error::EpochNotMatch(local_epoch));
+        } else if epoch > local_epoch {
+            debug!(
+                "Get Peer consult Request (epoch = {}) which epoch is higher than local ({})",
+                epoch, local_epoch
+            );
+            self.monitor_client.update_target_map().await;
         }
         self.inner
             .pgs
@@ -236,14 +248,8 @@ where
     #[rpc]
     async fn peer_finish(&self, request: PeerFinish) -> Result<()> {
         debug!("Get peer finish request: {}", request);
-        let PeerFinish {
-            pgid,
-            mut logs,
-            epoch,
-        } = request;
-        if epoch < self.get_epoch() {
-            return Err(Error::StaleEpoch);
-        }
+        self.check_epoch(&request)?;
+        let PeerFinish { pgid, mut logs, .. } = request;
         let local_pg_ver = self.inner.get_pg_version(pgid);
         logs.sort_by(|a, b| a.0.cmp(&b.0));
         for (log_id, op) in logs
@@ -261,7 +267,8 @@ where
     #[rpc]
     async fn heal(&self, request: HealReq) -> Result<Vec<(u64, Put)>> {
         debug!("Get heal request {:?}", request);
-        let HealReq { pgid, pg_ver } = request;
+        self.check_epoch(&request)?;
+        let HealReq { pgid, pg_ver, .. } = request;
         let local_pg_ver = self.inner.get_pg_version(pgid);
         if local_pg_ver <= pg_ver {
             return Err(Error::PgNotNewer);
@@ -275,7 +282,8 @@ where
 
     #[rpc]
     async fn pg_heartbeat(&self, request: PgHeartbeat) -> Result<()> {
-        let PgHeartbeat { pgid } = request;
+        self.check_epoch(&request)?;
+        let PgHeartbeat { pgid, .. } = request;
         self.inner.check_pg_state(pgid).await?;
         self.inner.update_pg_heartbeat_ts(pgid).await;
         Ok(())
@@ -297,6 +305,7 @@ where
                         let request = ForwardReq {
                             id: op_id,
                             op: request.clone(),
+                            epoch: self.get_epoch(),
                         };
                         match net
                             .call_timeout(peer.to_owned(), request, FORWARD_TIMEOUT)
@@ -329,25 +338,6 @@ where
         NetLocalHandle::current().local_addr()
     }
 
-    fn is_primary(&self, key: &str) -> bool {
-        let target_addrs = self.get_target_addrs(key);
-        self.local_addr() == target_addrs[0]
-    }
-
-    fn is_secondary(&self, key: &str) -> bool {
-        let target_addrs = self.get_target_addrs(key);
-        target_addrs
-            .iter()
-            .skip(1)
-            .any(|addr| *addr == self.local_addr())
-    }
-
-    fn is_responsible_pg(&self, pgid: PgId) -> bool {
-        let target_map = self.get_target_map();
-        let target_addrs = self.distributor.locate(pgid, &target_map);
-        target_addrs.iter().any(|addr| *addr == self.local_addr())
-    }
-
     fn get_target_map(&self) -> TargetMap {
         self.monitor_client.get_local_target_map()
     }
@@ -359,6 +349,34 @@ where
 
     fn get_epoch(&self) -> TargetMapVersion {
         self.monitor_client.get_local_target_map().get_version()
+    }
+
+    fn check_epoch<R>(&self, request: &R) -> Result<()>
+    where
+        R: EpochRequest,
+    {
+        let epoch = request.epoch();
+        let local_epoch = self.get_epoch();
+        if local_epoch > epoch {
+            debug!(
+                "Get Peer consult Request (epoch = {}) with lower epoch than local (epoch = {})",
+                epoch, local_epoch
+            );
+            Err(Error::EpochNotMatch(local_epoch))
+        } else if local_epoch < epoch {
+            debug!(
+                "Get Peer consult Request (epoch = {}) with higher epoch than local (epoch = {})",
+                epoch, local_epoch
+            );
+            let this = self.clone();
+            task::spawn(async move {
+                this.monitor_client.update_target_map().await;
+            })
+            .detach();
+            Err(Error::EpochNotMatch(local_epoch))
+        } else {
+            Ok(())
+        }
     }
 }
 
@@ -445,6 +463,24 @@ where
             Some(PgState::Irresponsible) | None => Err(Error::WrongTarget),
             Some(x) => Err(Error::PgUnavailable(x)),
         }
+    }
+
+    async fn is_primary(&self, pgid: PgId) -> bool {
+        let pgs = self.pgs.lock().await;
+        pgs.get(&pgid)
+            .map_or(false, |info| info.state == PgState::Active && info.primary)
+    }
+
+    async fn is_secondary(&self, pgid: PgId) -> bool {
+        let pgs = self.pgs.lock().await;
+        pgs.get(&pgid)
+            .map_or(false, |info| info.state == PgState::Active && !info.primary)
+    }
+
+    async fn is_responsible(&self, pgid: PgId) -> bool {
+        let pgs = self.pgs.lock().await;
+        pgs.get(&pgid)
+            .map_or(false, |info| info.state == PgState::Active)
     }
 
     fn assign_log_id(&self, pgid: PgId) -> u64 {

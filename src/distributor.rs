@@ -55,7 +55,7 @@ impl<const N: usize> Distributor<N> for SimpleHashDistributor<N> {
     }
 
     fn assign_pgid(&self, key: &[u8]) -> PgId {
-        let mut hasher = AHasher::default();
+        let mut hasher = AHasher::new_with_keys(0xdead, 0xbeaf);
         key.hash(&mut hasher);
         hasher.finish() as usize & (self.pg_num - 1)
     }

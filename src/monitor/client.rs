@@ -1,7 +1,7 @@
 use super::{TargetInfo, TargetMap, TargetMapVersion, TargetState};
 use crate::{constant::*, rpc::*, Error, Result};
 use futures::Future;
-use log::info;
+use log::{debug, info};
 use madsim::{net::NetLocalHandle, task, time::sleep};
 use std::{
     net::SocketAddr,
@@ -111,11 +111,16 @@ impl ServerClient {
 
     /// Check whether `new_map`'s version is greater than local map version,
     /// and try to update it.
-    /// 
+    ///
     /// By the way, it will wake the `WatchForTargetMap` Futures.
     fn _update_target_map(&self, new_map: TargetMap) {
         let mut local_map = self.target_map.lock().unwrap();
         if local_map.get_version() < new_map.get_version() {
+            debug!(
+                "Local target map is updated from {} to {}",
+                local_map.get_version(),
+                new_map.get_version()
+            );
             *local_map = new_map;
             // call waker to wake up the task
             if let Some(waker) = self.watch.lock().unwrap().take() {
@@ -153,7 +158,7 @@ impl Client {
         Ok(client)
     }
 
-    pub async fn get_local_target_map(&self) -> TargetMap {
+    pub fn get_local_target_map(&self) -> TargetMap {
         self.target_map.lock().unwrap().clone()
     }
 

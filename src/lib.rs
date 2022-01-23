@@ -57,8 +57,8 @@ pub enum Error {
     PgUnavailable(PgState),
     #[error("The pg is not more up-to-date")]
     PgNotNewer, // Used when find peers send some pg which is not more up-to-date during healing
-    #[error("The epoch is too old, try to update TargetMap from Monitor")]
-    StaleEpoch,
+    #[error("Epoch not match between request and the requested server (epoch = {0})")]
+    EpochNotMatch(TargetMapVersion),
 }
 
 impl From<std::io::Error> for Error {

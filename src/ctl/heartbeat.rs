@@ -67,8 +67,15 @@ where
                 async move {
                     (
                         addr,
-                        net.call_timeout(addr, PgHeartbeat { pgid }, PG_HEARTBEAT_TIMEOUT)
-                            .await,
+                        net.call_timeout(
+                            addr,
+                            PgHeartbeat {
+                                pgid,
+                                epoch: self.get_epoch(),
+                            },
+                            PG_HEARTBEAT_TIMEOUT,
+                        )
+                        .await,
                     )
                 }
             })

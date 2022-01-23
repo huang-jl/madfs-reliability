@@ -1,15 +1,4 @@
-use crate::{
-    constant::*,
-    ctl::ReliableCtl,
-    distributor::{Distributor, SimpleHashDistributor},
-    monitor::{
-        client::{Client as MonitorClient, ServerClient},
-        Monitor,
-    },
-    rpc::KvRequest,
-    service::KvService,
-    Error, PgId, Result,
-};
+use crate::{Error, PgId, Result, TargetMapVersion, constant::*, ctl::ReliableCtl, distributor::{Distributor, SimpleHashDistributor}, monitor::{Monitor, TargetMap, client::{Client as MonitorClient, ServerClient}}, rpc::KvRequest, service::KvService};
 use lazy_static::lazy_static;
 use log::*;
 use madsim::{
@@ -144,7 +133,7 @@ impl Client {
 
     pub async fn get_target_addrs(&self, key: &[u8]) -> [SocketAddr; REPLICA_SIZE] {
         let pgid = self.distributor.assign_pgid(key);
-        let target_map = self.monitor_client.get_local_target_map().await;
+        let target_map = self.monitor_client.get_local_target_map();
         self.distributor.locate(pgid, &target_map)
     }
 
@@ -200,8 +189,12 @@ impl Client {
         let targets = self.get_target_addrs(key.as_bytes()).await;
         let mut target_vals = Vec::new();
         for target in targets {
+            let request = crate::rpc::Get {
+                epoch: self.monitor_client.get_local_target_map().get_version(),
+                key: key.to_owned(),
+            };
             let res = self
-                .send_to(crate::rpc::Get(key.to_owned()), target, None)
+                .send_to(request, target, None)
                 .await;
             assert!(
                 matches!(res, Ok(Ok(Some(_)))),
@@ -220,6 +213,10 @@ impl Client {
         assert!(target_vals
             .iter()
             .all(|val| potential_vals.iter().any(|v| v == val)));
+    }
+
+    pub fn get_epoch(&self) -> TargetMapVersion {
+        self.monitor_client.get_local_target_map().get_version()
     }
 }
 
