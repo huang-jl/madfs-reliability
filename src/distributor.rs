@@ -67,7 +67,6 @@ mod test {
     use crate::distributor::{Distributor, SimpleHashDistributor};
     use crate::monitor::{TargetInfo, TargetMap, TargetState};
     use crate::test::common::*;
-    use crate::PgId;
     use rand::{seq::SliceRandom, thread_rng};
 
     fn init(

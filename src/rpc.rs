@@ -44,20 +44,26 @@ pub struct PeerConsult {
     pub pgid: PgId,
 }
 
-#[derive(Clone, Serialize, Deserialize, Request)]
+#[derive(Serialize, Deserialize, Request)]
 #[rtype("Result<()>")]
 pub struct PeerFinish {
     pub epoch: TargetMapVersion,
     pub pgid: PgId,
-    pub logs: Vec<(u64, Put)>,
+    pub heal: HealRes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
-#[rtype("Result<Vec<(u64, Put)>>")]
+#[rtype("Result<HealRes>")]
 pub struct HealReq {
     pub pgid: PgId,
     pub pg_ver: PgVersion,
     pub epoch: TargetMapVersion,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct HealRes {
+    pub logs: Vec<(PgVersion, Put)>,
+    pub snapshot: Option<(PgVersion, Vec<u8>)>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
@@ -141,10 +147,11 @@ impl Display for PeerFinish {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "PeerFinish {{ pgid: {}, epoch: {}, log length: {} }}",
+            "PeerFinish {{ pgid: {}, epoch: {}, snapshot_id :{:?}, log length: {} }}",
             self.pgid,
             self.epoch,
-            self.logs.len()
+            self.heal.snapshot.as_ref().map(|x| x.0),
+            self.heal.logs.len()
         )
     }
 }

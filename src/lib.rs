@@ -16,7 +16,6 @@ mod constant {
 
     pub const REPLICA_SIZE: usize = 3;
     pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
-    pub const FILE_PATH: &str = "service.blob";
 
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(1000);
     pub const FORWARD_RETRY: u32 = 3;
@@ -26,9 +25,6 @@ mod constant {
     pub const OUT_TIMEOUT: Duration = Duration::from_millis(20_000);
 
     pub const HEARTBEAT_PERIOD: Duration = Duration::from_millis(3000);
-
-    pub const RECOVER_TIMEOUT: Duration = Duration::from_millis(3000);
-    pub const RECOVER_RETRY: u32 = 3;
 
     /// Timeout of peering request
     pub const PEER_TIMEOUT: Duration = Duration::from_millis(500);

@@ -1,18 +1,8 @@
 use self::logging::LogManager;
-use crate::{
-    constant::*,
-    distributor::{Distributor, SimpleHashDistributor},
-    monitor::{client::ServerClient, TargetMap},
-    rpc::{
-        EpochRequest, ForwardReq, Get, HealReq, KvRequest, PeerConsult, PeerFinish, PgHeartbeat,
-        Put,
-    },
-    service::Store,
-    Error, PgId, PgVersion, Result, TargetMapVersion,
-};
-use futures::{lock::Mutex, stream::FuturesUnordered, StreamExt};
+use crate::{Error, PgId, PgVersion, Result, TargetMapVersion, constant::*, distributor::{Distributor, SimpleHashDistributor}, monitor::{client::ServerClient, TargetMap}, rpc::{EpochRequest, ForwardReq, Get, HealReq, HealRes, KvRequest, PeerConsult, PeerFinish, PgHeartbeat, Put}, service::Store};
+use futures::{lock::Mutex, stream::FuturesUnordered, Future, StreamExt};
 use log::{debug, error, info, warn};
-use madsim::{net::NetLocalHandle, task, time::Instant};
+use madsim::{fs, net::NetLocalHandle, task, time::Instant};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -21,11 +11,13 @@ use std::{
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc,
+        Arc, Mutex as StdMutex,
     },
+    task::Waker,
     time::Duration,
 };
 
+mod cleaner;
 pub mod heal;
 pub mod heartbeat;
 mod logging;
@@ -62,9 +54,10 @@ struct Inner<T> {
     service: Mutex<T>,
     logger: LogManager,
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
-    pgs: Mutex<HashMap<PgId, PgInfo>>,
+    pgs: StdMutex<HashMap<PgId, PgInfo>>,
     /// Recording the next index (e.g. 5 means the next operation will be assigned index 5)
     sequencer: Vec<AtomicU64>,
+    wakers: StdMutex<HashMap<PgId, HashMap<u64, Waker>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -84,12 +77,20 @@ struct PgInfo {
 pub enum PgState {
     /// Everything is alright
     Active,
-    /// The pg is unavailable (during peering).
+    /// The pg is unavailable (need peering).
     Inactive,
+    /// Error occur during peering, need to repeering
+    Damaged,
     /// Error occuring when forwarding or heartbeat
     Inconsistent,
     /// The pg is not of responsibility
     Irresponsible,
+}
+
+struct ApplyTask<'a, T> {
+    inner: &'a Inner<T>,
+    log_id: u64,
+    pgid: PgId,
 }
 
 #[madsim::service]
@@ -114,7 +115,20 @@ where
     async fn init(&self) {
         // reply logs
         for pgid in 0..self.pg_num {
-            for log_id in 0..self.inner.logger.upper(pgid) {
+            let lower = self.inner.logger.lower(pgid);
+            let upper = self.inner.logger.upper(pgid);
+            if lower > 0 {
+                self.inner
+                    .install(
+                        pgid,
+                        lower,
+                        fs::read(format!("snapshot.{}", pgid))
+                            .await
+                            .expect("Cannot get snapshot"),
+                    )
+                    .await;
+            }
+            for log_id in lower..upper {
                 self.inner.apply_log(pgid, log_id).await;
             }
         }
@@ -127,11 +141,6 @@ where
         let this = self.clone();
         task::spawn(async move {
             this.background_peer().await;
-        })
-        .detach();
-        let this = self.clone();
-        task::spawn(async move {
-            this.background_heal().await;
         })
         .detach();
     }
@@ -149,9 +158,10 @@ where
             request.key(),
             pgid
         );
-        self.inner.check_pg_state(pgid).await?;
+        self.inner.check_pg_state(pgid)?;
+        self.check_epoch(&request)?;
 
-        if self.inner.is_primary(pgid).await {
+        if self.inner.is_primary(pgid) {
             let op_id = self.inner.assign_log_id(pgid);
             let forward_res = self.forward_put_by_primary(&request, op_id).await;
 
@@ -164,7 +174,7 @@ where
                     "Error occur when forwarding, pg {} been marked Inconsistent: {}",
                     pgid, err
                 );
-                self.inner.set_pg_state(pgid, PgState::Inconsistent).await;
+                self.inner.set_pg_state(pgid, PgState::Inconsistent);
                 Err(err)
             } else {
                 Ok(())
@@ -180,9 +190,9 @@ where
         debug!("Receive Get from client, key = {}", request.key());
         self.check_epoch(&request)?;
         let pgid = self.distributor.assign_pgid(request.key().as_bytes());
-        self.inner.check_pg_state(pgid).await?;
+        self.inner.check_pg_state(pgid)?;
 
-        if self.inner.is_responsible(pgid).await {
+        if self.inner.is_responsible(pgid) {
             Ok(self.inner.get(request.key()).await)
         } else {
             Err(Error::WrongTarget)
@@ -196,13 +206,14 @@ where
         let ForwardReq { id, op, .. } = request;
         let pgid = self.distributor.assign_pgid(op.key().as_bytes());
         debug!(
-            "Get forward put request, key = {}, pgid = {}",
+            "Get forward put request, key = {}, pgid = {}, id = {}",
             op.key(),
-            pgid
+            pgid,
+            id
         );
-        self.inner.check_pg_state(pgid).await?;
+        self.inner.check_pg_state(pgid)?;
 
-        if !self.inner.is_secondary(pgid).await {
+        if !self.inner.is_secondary(pgid) {
             return Err(Error::WrongTarget);
         }
         self.inner.add_log(id, &op).await;
@@ -227,7 +238,7 @@ where
         self.inner
             .pgs
             .lock()
-            .await
+            .unwrap()
             .entry(pgid)
             .and_modify(|info| {
                 info.state = PgState::Inactive;
@@ -235,13 +246,7 @@ where
                 info.epoch = epoch;
                 info.heartbeat_ts = None;
             })
-            .or_insert(PgInfo {
-                state: PgState::Inactive,
-                primary: false,
-                applied_ptr: 0,
-                heartbeat_ts: None,
-                epoch,
-            });
+            .or_insert(PgInfo::default());
         Ok(self.inner.get_pg_version(pgid))
     }
 
@@ -249,23 +254,17 @@ where
     async fn peer_finish(&self, request: PeerFinish) -> Result<()> {
         debug!("Get peer finish request: {}", request);
         self.check_epoch(&request)?;
-        let PeerFinish { pgid, mut logs, .. } = request;
-        let local_pg_ver = self.inner.get_pg_version(pgid);
-        logs.sort_by(|a, b| a.0.cmp(&b.0));
-        for (log_id, op) in logs
-            .into_iter()
-            .filter(|(log_id, _)| *log_id >= local_pg_ver)
-        {
-            self.inner.add_log(log_id, &op).await;
-            self.inner.apply_log(pgid, log_id).await;
-        }
-        self.inner.set_pg_state(pgid, PgState::Active).await;
-        self.inner.update_pg_heartbeat_ts(pgid).await;
+        let PeerFinish {
+            pgid,
+            heal: heal_res,
+            ..
+        } = request;
+        self.handle_heal_res(pgid, heal_res).await;
         Ok(())
     }
 
     #[rpc]
-    async fn heal(&self, request: HealReq) -> Result<Vec<(u64, Put)>> {
+    async fn heal(&self, request: HealReq) -> Result<HealRes> {
         debug!("Get heal request {:?}", request);
         self.check_epoch(&request)?;
         let HealReq { pgid, pg_ver, .. } = request;
@@ -273,19 +272,15 @@ where
         if local_pg_ver <= pg_ver {
             return Err(Error::PgNotNewer);
         }
-        let mut res = Vec::new();
-        for log_id in pg_ver..local_pg_ver {
-            res.push((log_id, self.inner.logger.get(pgid, log_id).await.unwrap()));
-        }
-        Ok(res)
+        Ok(self.gen_heal_res(pgid, pg_ver).await)
     }
 
     #[rpc]
     async fn pg_heartbeat(&self, request: PgHeartbeat) -> Result<()> {
         self.check_epoch(&request)?;
         let PgHeartbeat { pgid, .. } = request;
-        self.inner.check_pg_state(pgid).await?;
-        self.inner.update_pg_heartbeat_ts(pgid).await;
+        self.inner.check_pg_state(pgid)?;
+        self.inner.update_pg_heartbeat_ts(pgid);
         Ok(())
     }
 
@@ -351,6 +346,9 @@ where
         self.monitor_client.get_local_target_map().get_version()
     }
 
+    /// 1. local epoch is greater: refusing the request.
+    /// 2. local epoch is less: refusing the request and try to update target map.
+    /// 3. equal: passing the check.
     fn check_epoch<R>(&self, request: &R) -> Result<()>
     where
         R: EpochRequest,
@@ -394,8 +392,9 @@ where
             service: Mutex::new(service),
             logger,
             distributor: Box::new(SimpleHashDistributor::new(pg_num)),
-            pgs: Mutex::new(HashMap::new()),
+            pgs: StdMutex::new(HashMap::new()),
             sequencer,
+            wakers: StdMutex::new(HashMap::new()),
         }
     }
     /*
@@ -407,24 +406,49 @@ where
         self.service.lock().await.get(&format!("{}.{}", pgid, key))
     }
 
+    /// snapshot PG `pgid` until `applied_ptr`
+    async fn snapshot(&self, pgid: PgId) {
+        let service = self.service.lock().await; // lock the service
+        let info = self.pgs.lock().unwrap().get(&pgid).cloned();
+        if let Some(info) = info {
+            let data = service.get_pg_data(pgid);
+            let file = fs::File::create(format!("snapshot.{}", pgid))
+                .await
+                .unwrap();
+            file.write_all_at(&data, 0).await.unwrap();
+            self.logger.snapshot(pgid, info.applied_ptr).await;
+            debug!("Snapshot pg {} until {}", pgid, info.applied_ptr);
+        }
+    }
+
+    async fn install(&self, pgid: PgId, id: PgVersion, data: Vec<u8>) {
+        self.service.lock().await.push_pg_data(pgid, data);
+        self.pgs
+            .lock()
+            .unwrap()
+            .entry(pgid)
+            .or_insert(PgInfo::default())
+            .applied_ptr = id;
+    }
+
     fn get_pg_version(&self, pgid: PgId) -> PgVersion {
         self.logger.upper(pgid)
     }
 
-    async fn get_pg_state(&self, pgid: PgId) -> Option<PgState> {
-        self.pgs.lock().await.get(&pgid).map(|info| info.state)
+    fn get_pg_state(&self, pgid: PgId) -> Option<PgState> {
+        self.pgs.lock().unwrap().get(&pgid).map(|info| info.state)
     }
 
-    async fn update_pg_heartbeat_ts(&self, pgid: PgId) {
-        if let Some(info) = self.pgs.lock().await.get_mut(&pgid) {
+    fn update_pg_heartbeat_ts(&self, pgid: PgId) {
+        if let Some(info) = self.pgs.lock().unwrap().get_mut(&pgid) {
             info.heartbeat_ts = Some(Instant::now());
         }
     }
 
-    async fn set_pg_state(&self, pgid: PgId, state: PgState) {
+    fn set_pg_state(&self, pgid: PgId, state: PgState) {
         self.pgs
             .lock()
-            .await
+            .unwrap()
             .entry(pgid)
             .and_modify(|info| info.state = state);
     }
@@ -434,56 +458,110 @@ where
     }
 
     async fn apply_log(&self, pgid: PgId, log_id: u64) {
+        self.wait_for_apply(pgid, log_id).await;
         let op = self.logger.get(pgid, log_id).await.unwrap();
         let (k, v) = op.take();
         self.service
             .lock()
             .await
             .put(format!("{}.{}", pgid, k.unwrap()), v.unwrap());
-        self.pgs
-            .lock()
-            .await
-            .entry(pgid)
-            .and_modify(|info| info.applied_ptr += 1)
-            .or_insert(PgInfo {
-                state: PgState::Inactive,
-                applied_ptr: 1,
-                heartbeat_ts: None,
-                primary: false,
-                epoch: 0,
-            });
+        let mut pgs = self.pgs.lock().unwrap();
+        let info = pgs
+            .get_mut(&pgid)
+            .expect(&format!("Cannot get Pg {}'s info", pgid));
+        // let info = pgs.entry(pgid).or_insert(PgInfo {
+        //     state: PgState::Inactive,
+        //     applied_ptr: 0,
+        //     heartbeat_ts: None,
+        //     primary: false,
+        //     epoch: 0,
+        // });
+        assert_eq!(
+            info.applied_ptr, log_id,
+            "applying log {} for pg {} does not obey order",
+            log_id, pgid
+        );
+        info.applied_ptr += 1;
+        // wake the waiting task
+        if let Some(wakers) = self.wakers.lock().unwrap().get_mut(&pgid) {
+            if let Some(waker) = wakers.remove(&info.applied_ptr) {
+                waker.wake();
+            }
+        }
     }
 
     /// Check whether this server can serve `pgid`.
     ///
     /// Only Active can return Ok
-    async fn check_pg_state(&self, pgid: PgId) -> Result<()> {
-        match self.get_pg_state(pgid).await {
+    fn check_pg_state(&self, pgid: PgId) -> Result<()> {
+        match self.get_pg_state(pgid) {
             Some(PgState::Active) => Ok(()),
             Some(PgState::Irresponsible) | None => Err(Error::WrongTarget),
             Some(x) => Err(Error::PgUnavailable(x)),
         }
     }
 
-    async fn is_primary(&self, pgid: PgId) -> bool {
-        let pgs = self.pgs.lock().await;
+    fn is_primary(&self, pgid: PgId) -> bool {
+        let pgs = self.pgs.lock().unwrap();
         pgs.get(&pgid)
             .map_or(false, |info| info.state == PgState::Active && info.primary)
     }
 
-    async fn is_secondary(&self, pgid: PgId) -> bool {
-        let pgs = self.pgs.lock().await;
+    fn is_secondary(&self, pgid: PgId) -> bool {
+        let pgs = self.pgs.lock().unwrap();
         pgs.get(&pgid)
             .map_or(false, |info| info.state == PgState::Active && !info.primary)
     }
 
-    async fn is_responsible(&self, pgid: PgId) -> bool {
-        let pgs = self.pgs.lock().await;
+    fn is_responsible(&self, pgid: PgId) -> bool {
+        let pgs = self.pgs.lock().unwrap();
         pgs.get(&pgid)
             .map_or(false, |info| info.state == PgState::Active)
     }
 
     fn assign_log_id(&self, pgid: PgId) -> u64 {
         self.sequencer[pgid].fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// `ApplyTask` is a future which will wait until `applied_ptr == log_id`
+    fn wait_for_apply(&self, pgid: PgId, log_id: u64) -> ApplyTask<T> {
+        ApplyTask {
+            inner: self,
+            log_id,
+            pgid,
+        }
+    }
+}
+
+impl Default for PgInfo {
+    fn default() -> Self {
+        Self {
+            state: PgState::Inconsistent,
+            applied_ptr: 0,
+            heartbeat_ts: None,
+            primary: false,
+            epoch: 0,
+        }
+    }
+}
+
+impl<'a, T> Future for ApplyTask<'a, T> {
+    type Output = ();
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut pgs = self.inner.pgs.lock().unwrap();
+        let mut global_wakers = self.inner.wakers.lock().unwrap();
+        let info = pgs.entry(self.pgid).or_insert(PgInfo::default());
+        let wakers = global_wakers.entry(self.pgid).or_insert(HashMap::new());
+        if info.applied_ptr == self.log_id {
+            return std::task::Poll::Ready(());
+        }
+
+        wakers.insert(self.log_id, cx.waker().clone());
+
+        std::task::Poll::Pending
     }
 }

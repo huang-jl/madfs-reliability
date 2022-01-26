@@ -1,7 +1,7 @@
 use super::{TargetInfo, TargetMap, TargetMapVersion, TargetState};
 use crate::{constant::*, rpc::*, Error, Result};
 use futures::Future;
-use log::{debug, info};
+use log::debug;
 use madsim::{net::NetLocalHandle, task, time::sleep};
 use std::{
     net::SocketAddr,

@@ -6,7 +6,7 @@ use crate::{
 };
 pub use common::{create_monitor, gen_random_put, Client, KvServerCluster};
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{info, warn};
+use log::warn;
 use madsim::time::sleep;
 use std::{collections::HashMap, time::Duration};
 
@@ -98,7 +98,8 @@ async fn one_pg_crash_and_up() {
 
     cluster.crash(CRASH_TARGET_IDX);
     warn!("Server crash!");
-    // Make sure all keys is unavaiable right after the server is crash
+    // Make sure all keys is unavaiable right after the server is crash.
+    // These Put requests are sending concurrently!
     let mut tasks = FuturesUnordered::new();
     for (key, v) in golden.iter_mut() {
         let (_, value) = gen_random_put(5, 10);
@@ -116,6 +117,7 @@ async fn one_pg_crash_and_up() {
     }
 
     sleep(Duration::from_secs(10)).await;
+    client.update_target_map().await;
 
     // Add more keys
     for _ in 0..50 {
@@ -131,7 +133,11 @@ async fn one_pg_crash_and_up() {
         };
 
         let res = client.send(request.clone(), None).await;
-        assert!(matches!(res, Ok(Ok(_))));
+        assert!(
+            matches!(res, Ok(Ok(_))),
+            "Add more keys get response: {:?}",
+            res
+        );
     }
 
     cluster.restart(CRASH_TARGET_IDX).await;

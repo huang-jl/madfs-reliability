@@ -56,17 +56,17 @@ impl Store for KvService {
 
     fn push_pg_data(&mut self, pgid: PgId, data: Vec<u8>) {
         //1. clear the potential pgid's data
-        assert_eq!(
-            self.kv
-                .range(
-                    pgid.to_string() + "."
-                        ..(pgid).to_string() + &format!("{}", ('.' as u8 + 1) as char)
-                )
-                .count(),
-            0,
-            "push data to pg {}, but it already has keys",
-            pgid
-        );
+        let keys = self
+            .kv
+            .range(
+                pgid.to_string() + "."
+                    ..(pgid).to_string() + &format!("{}", ('.' as u8 + 1) as char),
+            )
+            .map(|(k, _)| k.clone())
+            .collect::<Vec<_>>();
+        for key in keys {
+            self.kv.remove(&key);
+        }
         //2. push the pg data into kv
         let mut pg_data: BTreeMap<String, Value> = bincode::deserialize(&data).unwrap();
         self.kv.append(&mut pg_data);
@@ -75,26 +75,6 @@ impl Store for KvService {
     fn get_key_version(&self, key: &str) -> Option<u64> {
         self.kv.get(key).map(|value| value.version)
     }
-
-    // fn get_heal_data(&self, pgid: PgId) -> Vec<(String, u64)> {
-    //     self.kv
-    //         .range(
-    //             pgid.to_string() + "."
-    //                 ..(pgid).to_string() + &format!("{}", ('.' as u8 + 1) as char),
-    //         )
-    //         .map(|(k, v)| (k.clone(), v.version))
-    //         .collect()
-    // }
-
-    // fn push_heal_data(&mut self, pgid: PgId, data: Vec<(String, Value)>) {
-    //     for (key, value) in data {
-    //         assert_eq!(
-    //             key.split(".").next().unwrap().parse::<PgId>().unwrap(),
-    //             pgid
-    //         );
-    //         self.kv.insert(key, value);
-    //     }
-    // }
 
     fn snapshot(&self) -> Vec<u8> {
         bincode::serialize(&self.kv).unwrap()

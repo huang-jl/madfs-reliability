@@ -15,26 +15,26 @@ where
     /// Primary will periodically send heartbeat to secondary.
     /// If secondary do not get heartbeat or primary do not get secondary's response,
     /// then mark this pg Inactive.
-    pub(super) async fn heartbeat(&self) {
+    pub(super) async fn background_heartbeat(&self) {
         loop {
             sleep(Duration::from_secs(1)).await;
 
-            let mut pgs = self.inner.pgs.lock().await;
-            pgs.iter_mut()
-                .filter(|(_, info)| {
-                    info.state == PgState::Active
-                        && info
-                            .heartbeat_ts
-                            .map_or(true, |t| t.elapsed() > Duration::from_secs(3))
-                })
-                .for_each(|(pgid, info)| {
-                    warn!(
-                        "Pg {} do not get heartbeat for long time, being marked Inconsistent",
-                        pgid
-                    );
-                    info.state = PgState::Inconsistent;
-                });
             let mut requests = {
+                let mut pgs = self.inner.pgs.lock().unwrap();
+                pgs.iter_mut()
+                    .filter(|(_, info)| {
+                        info.state == PgState::Active
+                            && info
+                                .heartbeat_ts
+                                .map_or(true, |t| t.elapsed() > Duration::from_secs(3))
+                    })
+                    .for_each(|(pgid, info)| {
+                        warn!(
+                            "Pg {} do not get heartbeat for long time, being marked Inconsistent",
+                            pgid
+                        );
+                        info.state = PgState::Inconsistent;
+                    });
                 pgs.iter()
                     .filter(|(_, info)| {
                         // Only send heartbeat if self is primary.
@@ -47,7 +47,6 @@ where
                     })
                     .collect::<FuturesUnordered<_>>()
             };
-            drop(pgs);
             while let Some((pgid, res)) = requests.next().await {
                 if let Err(err) = res {
                     error!("Error occuring when heartbeat pg {}: {}", pgid, err);
@@ -86,7 +85,7 @@ where
             }
             res??;
         }
-        self.inner.update_pg_heartbeat_ts(pgid).await;
+        self.inner.update_pg_heartbeat_ts(pgid);
         Ok(())
     }
 }
