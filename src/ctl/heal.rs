@@ -2,15 +2,15 @@
 //! server will send Heal request to the most up-to-date server. The most up-to-date server will
 //! response with the missing logs.
 
-use super::{Error, PgState, ReliableCtl, Result};
-use crate::constant::HEAL_REQ_TIMEOUT;
-use crate::rpc::{HealReq, HealRes};
+use super::{call_timeout_retry, Error, PgState, ReliableCtl, Result};
+use crate::constant::{HEAL_REQ_TIMEOUT, RETRY_TIMES};
+use crate::rpc::{HealData, HealReq};
 use crate::PgVersion;
 use crate::{service::Store, PgId};
 use futures::stream::{FuturesUnordered, StreamExt};
-use log::{debug, error};
-use madsim::{fs, net::NetLocalHandle, time::sleep};
-use std::{net::SocketAddr, time::Duration};
+use log::error;
+use madsim::{fs, time::sleep};
+use std::time::Duration;
 
 impl<T> ReliableCtl<T>
 where
@@ -18,7 +18,7 @@ where
 {
     pub(super) async fn background_heal(&self) {
         loop {
-            sleep(Duration::from_secs(2)).await;
+            sleep(Duration::from_secs(3)).await;
             // Scan the local pgs and find those state is in `Inconsitent`.
             // Then send heal request to primary (we guarantee that primary is up-to-date in its epoch).
             let mut heal_tasks = self
@@ -27,13 +27,11 @@ where
                 .lock()
                 .unwrap()
                 .iter()
-                .filter(|(_, info)| info.state == PgState::Inconsistent && !info.primary)
+                .filter(|(_, info)| info.state == PgState::Inconsistent && info.primary)
                 .map(|x| {
                     let this = self.clone();
-                    let target_map = self.get_target_map();
                     let pgid = *x.0;
-                    let primary_addr = self.distributor.locate(pgid, &target_map)[0];
-                    async move { (pgid, this.heal_for(pgid, primary_addr).await) }
+                    async move { (pgid, this.heal_for(pgid).await) }
                 })
                 .collect::<FuturesUnordered<_>>();
             while let Some((pgid, res)) = heal_tasks.next().await {
@@ -45,37 +43,10 @@ where
         }
     }
 
-    pub(super) async fn heal_for(&self, pgid: PgId, target_addr: SocketAddr) -> Result<()> {
-        // 1. send local pg version to `target_addr`
-        let request = HealReq {
-            pgid,
-            pg_ver: self.inner.get_pg_version(pgid),
-            epoch: self.get_epoch(),
-        };
-        let net = NetLocalHandle::current();
-        // 2. peer will response with a HealRes according to sending pg version
-        match net
-            .call_timeout(target_addr, request.clone(), HEAL_REQ_TIMEOUT)
-            .await
-        {
-            Ok(Ok(res)) => {
-                self.handle_heal_res(pgid, res).await;
-                debug!(
-                    "Heal for pg {}, current version = {}",
-                    pgid,
-                    self.inner.get_pg_version(pgid)
-                );
-                Ok(())
-            }
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(Error::from(err)),
-        }
-    }
-
-    /// Generate the heal response for pg `pgid`
+    /// Generate the heal response of pg `pgid` for the peer which pg version is `ver`.
     ///
     /// `ver` - the pg version of the remote peer
-    pub(super) async fn gen_heal_res(&self, pgid: PgId, ver: PgVersion) -> HealRes {
+    pub(super) async fn gen_heal_res(&self, pgid: PgId, ver: PgVersion) -> HealData {
         let local_pg_ver = self.inner.get_pg_version(pgid);
         let local_lower = self.inner.logger.lower(pgid);
         let mut logs = Vec::new();
@@ -91,15 +62,15 @@ where
         } else {
             None
         };
-        HealRes {
+        HealData {
             logs,
             snapshot: snapshot.map(|x| (local_lower, x)),
         }
     }
 
     /// When receive a `HealRes` from peers, call this function to heal pg `pgid`.
-    pub(super) async fn handle_heal_res(&self, pgid: PgId, heal_res: HealRes) {
-        let HealRes { mut logs, snapshot } = heal_res;
+    pub(super) async fn handle_heal_data(&self, pgid: PgId, heal_data: HealData) {
+        let HealData { mut logs, snapshot } = heal_data;
         let local_pg_ver = self.inner.get_pg_version(pgid);
         if let Some((id, data)) = snapshot {
             if id > local_pg_ver {
@@ -116,5 +87,41 @@ where
         }
         self.inner.set_pg_state(pgid, PgState::Active);
         self.inner.update_pg_heartbeat_ts(pgid);
+    }
+
+    /// Healing is guided by primary.
+    /// 1. Collect all peers' pg versions.
+    /// 2. Send the `HealRes` to lagging peers.
+    pub async fn heal_for(&self, pgid: PgId) -> Result<()> {
+        let target_map = self.get_target_map();
+        let (peers, peer_vers) = self.collect_pg_ver(pgid, &target_map).await?;
+        let local_pg_ver = self.inner.get_pg_version(pgid);
+        if let Some((addr, ver)) = peers
+            .iter()
+            .zip(peer_vers.iter())
+            .find(|(_, ver)| **ver > local_pg_ver)
+        {
+            error!(
+                "Secondary {} has higher pg version = {} than primary = {}, for pg {}",
+                addr, ver, local_pg_ver, pgid
+            );
+            return Err(Error::PgStale);
+        }
+        let mut requests = peers
+            .into_iter()
+            .zip(peer_vers.into_iter())
+            .map(|(addr, ver)| async move {
+                let request = HealReq {
+                    epoch: self.get_epoch(),
+                    pgid,
+                    heal_data: self.gen_heal_res(pgid, ver).await,
+                };
+                call_timeout_retry(addr, request, HEAL_REQ_TIMEOUT, RETRY_TIMES).await
+            })
+            .collect::<FuturesUnordered<_>>();
+        while let Some(res) = requests.next().await {
+            res??;
+        }
+        Ok(())
     }
 }

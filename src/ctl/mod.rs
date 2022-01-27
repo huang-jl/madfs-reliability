@@ -1,20 +1,29 @@
 use self::logging::LogManager;
-use crate::{Error, PgId, PgVersion, Result, TargetMapVersion, constant::*, distributor::{Distributor, SimpleHashDistributor}, monitor::{client::ServerClient, TargetMap}, rpc::{EpochRequest, ForwardReq, Get, HealReq, HealRes, KvRequest, PeerConsult, PeerFinish, PgHeartbeat, Put}, service::Store};
+use crate::{
+    call_timeout_retry,
+    constant::*,
+    distributor::{Distributor, SimpleHashDistributor},
+    monitor::{client::ServerClient, TargetMap},
+    rpc::{
+        EpochRequest, FetchHealData, ForwardReq, Get, HealData, HealReq, KvRequest, PeerFinish,
+        PgConsult, PgHeartbeat, Put,
+    },
+    service::Store,
+    Error, PgId, PgVersion, Result, TargetMapVersion,
+};
 use futures::{lock::Mutex, stream::FuturesUnordered, Future, StreamExt};
-use log::{debug, error, info, warn};
+use log::{debug, error};
 use madsim::{fs, net::NetLocalHandle, task, time::Instant};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
     fmt::Debug,
-    io,
     net::SocketAddr,
     sync::{
         atomic::{AtomicU64, Ordering},
         Arc, Mutex as StdMutex,
     },
     task::Waker,
-    time::Duration,
 };
 
 mod cleaner;
@@ -221,32 +230,21 @@ where
         Ok(())
     }
 
+    /// PgConsult allow two epoch not match because it may happen
+    /// during peering, and peers do not know cluster map update
     #[rpc]
-    async fn peer_consult(&self, request: PeerConsult) -> Result<PgVersion> {
-        debug!("Get peer consult request: {:?}", request);
-        let PeerConsult { pgid, epoch } = request;
+    async fn pg_consult(&self, request: PgConsult) -> Result<PgVersion> {
+        debug!("Get pg consult request: {:?}", request);
+        let PgConsult { pgid, epoch } = request;
         let local_epoch = self.get_epoch();
         if epoch < local_epoch {
             return Err(Error::EpochNotMatch(local_epoch));
         } else if epoch > local_epoch {
-            debug!(
-                "Get Peer consult Request (epoch = {}) which epoch is higher than local ({})",
-                epoch, local_epoch
-            );
             self.monitor_client.update_target_map().await;
+            if epoch != self.get_epoch() {
+                return Err(Error::EpochNotMatch(local_epoch));
+            }
         }
-        self.inner
-            .pgs
-            .lock()
-            .unwrap()
-            .entry(pgid)
-            .and_modify(|info| {
-                info.state = PgState::Inactive;
-                info.primary = false;
-                info.epoch = epoch;
-                info.heartbeat_ts = None;
-            })
-            .or_insert(PgInfo::default());
         Ok(self.inner.get_pg_version(pgid))
     }
 
@@ -255,22 +253,20 @@ where
         debug!("Get peer finish request: {}", request);
         self.check_epoch(&request)?;
         let PeerFinish {
-            pgid,
-            heal: heal_res,
-            ..
+            pgid, heal_data, ..
         } = request;
-        self.handle_heal_res(pgid, heal_res).await;
+        self.handle_heal_data(pgid, heal_data).await;
         Ok(())
     }
 
     #[rpc]
-    async fn heal(&self, request: HealReq) -> Result<HealRes> {
+    async fn fetch_heal_res(&self, request: FetchHealData) -> Result<HealData> {
         debug!("Get heal request {:?}", request);
         self.check_epoch(&request)?;
-        let HealReq { pgid, pg_ver, .. } = request;
+        let FetchHealData { pgid, pg_ver, .. } = request;
         let local_pg_ver = self.inner.get_pg_version(pgid);
-        if local_pg_ver <= pg_ver {
-            return Err(Error::PgNotNewer);
+        if local_pg_ver < pg_ver {
+            return Err(Error::PgStale);
         }
         Ok(self.gen_heal_res(pgid, pg_ver).await)
     }
@@ -281,6 +277,16 @@ where
         let PgHeartbeat { pgid, .. } = request;
         self.inner.check_pg_state(pgid)?;
         self.inner.update_pg_heartbeat_ts(pgid);
+        Ok(())
+    }
+
+    #[rpc]
+    async fn heal_req(&self, request: HealReq) -> Result<()> {
+        self.check_epoch(&request)?;
+        let HealReq {
+            pgid, heal_data, ..
+        } = request;
+        self.handle_heal_data(pgid, heal_data).await;
         Ok(())
     }
 
@@ -295,32 +301,18 @@ where
             .map(|peer| {
                 let request = request.clone();
                 async move {
-                    let net = NetLocalHandle::current();
-                    for _ in 0..FORWARD_RETRY {
-                        let request = ForwardReq {
-                            id: op_id,
-                            op: request.clone(),
-                            epoch: self.get_epoch(),
-                        };
-                        match net
-                            .call_timeout(peer.to_owned(), request, FORWARD_TIMEOUT)
-                            .await
-                        {
-                            Ok(x) => return x,
-                            Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
-                            Err(err) => return Err(Error::NetworkError(err.to_string())),
-                        }
-                    }
-                    Err(Error::NetworkError(format!(
-                        "Forward Request cannot get response from {}, retry {} times",
-                        peer, FORWARD_RETRY
-                    )))
+                    let request = ForwardReq {
+                        id: op_id,
+                        op: request.clone(),
+                        epoch: self.get_epoch(),
+                    };
+                    call_timeout_retry(peer.to_owned(), request, FORWARD_TIMEOUT, RETRY_TIMES).await
                 }
             })
             .collect::<FuturesUnordered<_>>();
 
         while let Some(res) = tasks.next().await {
-            res?
+            res??;
         }
         Ok(())
     }

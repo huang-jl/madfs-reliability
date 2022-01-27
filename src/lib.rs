@@ -1,5 +1,8 @@
 use ctl::PgState;
+use log::error;
+use madsim::{net::rpc::Request, net::NetLocalHandle};
 use serde::{Deserialize, Serialize};
+use std::{io, net::SocketAddr, time::Duration};
 use thiserror::Error;
 
 pub mod ctl;
@@ -17,8 +20,9 @@ mod constant {
     pub const REPLICA_SIZE: usize = 3;
     pub const MONITOR_ADDR: &str = "10.0.0.1:8000";
 
+    pub const RETRY_TIMES: u32 = 1;
+
     pub const FORWARD_TIMEOUT: Duration = Duration::from_millis(1000);
-    pub const FORWARD_RETRY: u32 = 3;
 
     pub const MONITOR_CHECK_PERIOD: Duration = Duration::from_millis(2000);
     pub const DOWN_TIMEOUT: Duration = Duration::from_millis(10_000);
@@ -51,8 +55,8 @@ pub enum Error {
     VersionDoesNotExist(u64),
     #[error("The pg on corressponding server is unavailable: {0:?}")]
     PgUnavailable(PgState),
-    #[error("The pg is not more up-to-date")]
-    PgNotNewer, // Used when find peers send some pg which is not more up-to-date during healing
+    #[error("The pg is stale")]
+    PgStale, // Used when find peers send some pg which is not more up-to-date during healing
     #[error("Epoch not match between request and the requested server (epoch = {0})")]
     EpochNotMatch(TargetMapVersion),
 }
@@ -64,3 +68,30 @@ impl From<std::io::Error> for Error {
 }
 
 type Result<T> = std::result::Result<T, Error>;
+
+/// send rpc call with retry.
+async fn call_timeout_retry<T>(
+    dst: SocketAddr,
+    request: T,
+    timeout: Duration,
+    retry: u32,
+) -> Result<<T as Request>::Response>
+where
+    T: Request + Clone,
+{
+    let net = NetLocalHandle::current();
+    for _ in 0..=retry {
+        match net.call_timeout(dst, request.clone(), timeout).await {
+            Ok(res) => return Ok(res),
+            Err(err) if err.kind() == io::ErrorKind::TimedOut => {}
+            Err(err) => {
+                error!("Request to {} get err: {}", dst, err);
+                return Err(Error::NetworkError(err.to_string()));
+            }
+        }
+    }
+    return Err(Error::NetworkError(format!(
+        "Request to {} {} times still timeout",
+        dst, retry + 1
+    )));
+}

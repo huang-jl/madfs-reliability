@@ -77,7 +77,7 @@ async fn one_pg_crash_and_up() {
     let mut golden = HashMap::new();
 
     // Wait for the cluster to start up (peering)
-    sleep(Duration::from_millis(5000)).await;
+    sleep(Duration::from_secs(5)).await;
 
     // Put some random keys
     for _ in 0..500 {
@@ -150,7 +150,7 @@ async fn one_pg_crash_and_up() {
     }
 }
 
-// #[madsim::test]
+#[madsim::test]
 async fn crash_and_up() {
     const SERVER_NUM: usize = 10;
     const CRASH_TARGET_IDX: usize = 0;
@@ -195,10 +195,10 @@ async fn crash_and_up() {
     // Server 0 is crashed and then restart
     cluster.crash(CRASH_TARGET_IDX);
     warn!("Server crash!");
-    sleep(Duration::from_millis(25_000)).await;
+    sleep(Duration::from_secs(15)).await;
     cluster.restart(CRASH_TARGET_IDX).await;
     warn!("Server restart!");
-    sleep(Duration::from_millis(15_000)).await;
+    sleep(Duration::from_secs(15)).await;
     client.update_target_map().await;
     for (key, value) in golden.iter() {
         client.check_consistency(key, value).await;

@@ -5,22 +5,15 @@
 //! 3. Find the highest pg version among all peers and let the primary up-to-date (e.g. collect the missing logs).
 //! 4. Primary brings all secondary up-to-date and mark this pg active.
 
-use super::{PgState, ReliableCtl};
-use crate::{
-    constant::*,
-    ctl::PgInfo,
-    monitor::TargetMap,
-    rpc::{PeerConsult, PeerFinish},
-    service::Store,
-    PgId, PgVersion, Result,
-};
+use super::{call_timeout_retry, PgState, ReliableCtl};
+use crate::{PgId, PgVersion, Result, constant::*, ctl::PgInfo, monitor::TargetMap, rpc::{FetchHealData, PeerFinish, PgConsult}, service::Store};
 use futures::{
     join, select,
     stream::{FuturesOrdered, FuturesUnordered, StreamExt},
     FutureExt,
 };
 use log::{debug, error};
-use madsim::{net::NetLocalHandle, time::sleep};
+use madsim::time::sleep;
 use std::{net::SocketAddr, time::Duration};
 
 impl<T> ReliableCtl<T>
@@ -29,8 +22,7 @@ where
 {
     /// When target map changes, the peering procedure will start.
     ///
-    /// *Important*: Once finish peering will the `background_heal`
-    ///  and `background_snapshot` begin.
+    /// *Important*: We guarantee that we use the same target map when peering
     pub(super) async fn background_peer(&self) {
         loop {
             let target_map = self.get_target_map();
@@ -99,6 +91,8 @@ where
         }
     }
 
+    /// If the `background_peer` failed, then background repeer
+    /// try to peer again until the cluster map changed
     pub(super) async fn backgounrd_repeer(&self) {
         loop {
             sleep(Duration::from_secs(2)).await;
@@ -135,7 +129,7 @@ where
     pub(super) async fn peer_for(&self, pgid: PgId, target_map: &TargetMap) -> Result<()> {
         // collect pg version
         let (peers, peer_res) = self.collect_pg_ver(pgid, target_map).await?;
-        // if peer has higher version then heal it (makes it up-to-date)
+        // if peer has higher version then ask it for consistency
         let local_pg_ver = self.inner.get_pg_version(pgid);
         if let Some(addr) = peer_res
             .iter()
@@ -144,23 +138,18 @@ where
             .max_by(|a, b| a.0.cmp(b.0))
             .map(|x| x.1)
         {
-            self.heal_for(pgid, *addr).await?;
+            self.ask_for_consistency(pgid, *addr).await?;
         }
         // let every replica consistent.
         let mut requests = FuturesUnordered::new();
         for (addr, ver) in peers.into_iter().zip(peer_res.into_iter()) {
-            let net = NetLocalHandle::current();
             requests.push(async move {
-                net.call_timeout(
-                    addr,
-                    PeerFinish {
-                        epoch: target_map.get_version(),
-                        pgid,
-                        heal: self.gen_heal_res(pgid, ver).await,
-                    },
-                    PEER_TIMEOUT,
-                )
-                .await
+                let req = PeerFinish {
+                    epoch: target_map.get_version(),
+                    pgid,
+                    heal_data: self.gen_heal_res(pgid, ver).await,
+                };
+                call_timeout_retry(addr, req, PEER_TIMEOUT, RETRY_TIMES).await
             });
         }
         while let Some(res) = requests.next().await {
@@ -173,7 +162,7 @@ where
     }
 
     /// Return peer address and their pg versions
-    async fn collect_pg_ver(
+    pub(super) async fn collect_pg_ver(
         &self,
         pgid: PgId,
         target_map: &TargetMap,
@@ -188,19 +177,12 @@ where
         let mut requests = peers
             .iter()
             .map(|addr| {
-                let net = NetLocalHandle::current();
+                let req = PgConsult {
+                    pgid,
+                    epoch: target_map.get_version(),
+                };
                 let addr = *addr;
-                async move {
-                    net.call_timeout(
-                        addr,
-                        PeerConsult {
-                            pgid,
-                            epoch: target_map.get_version(),
-                        },
-                        PEER_TIMEOUT,
-                    )
-                    .await
-                }
+                async move { call_timeout_retry(addr, req, PEER_TIMEOUT, RETRY_TIMES).await }
             })
             .collect::<FuturesOrdered<_>>();
         let mut peer_res: Vec<PgVersion> = Vec::new();
@@ -209,4 +191,22 @@ where
         }
         Ok((peers, peer_res))
     }
+
+    /// Request initiatively for the `HealRes` to make the pg `pgid` up-to-date with `target_addr`.
+    async fn ask_for_consistency(&self, pgid: PgId, target_addr: SocketAddr) -> Result<()> {
+        let request = FetchHealData {
+            pgid,
+            pg_ver: self.inner.get_pg_version(pgid),
+            epoch: self.get_epoch(),
+        };
+        let res = call_timeout_retry(target_addr, request, HEAL_REQ_TIMEOUT, RETRY_TIMES).await??;
+        self.handle_heal_data(pgid, res).await;
+        debug!(
+            "Heal for pg {}, current version = {}",
+            pgid,
+            self.inner.get_pg_version(pgid)
+        );
+        Ok(())
+    }
+
 }

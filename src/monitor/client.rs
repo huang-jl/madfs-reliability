@@ -1,5 +1,5 @@
 use super::{TargetInfo, TargetMap, TargetMapVersion, TargetState};
-use crate::{constant::*, rpc::*, Error, Result};
+use crate::{Error, Result, constant::*, rpc::*};
 use futures::Future;
 use log::debug;
 use madsim::{net::NetLocalHandle, task, time::sleep};

@@ -37,31 +37,42 @@ pub struct ForwardReq {
     pub epoch: TargetMapVersion,
 }
 
+#[derive(Clone, Serialize, Deserialize, Request)]
+#[rtype("Result<()>")]
+/// Primary checks pgs periodically.
+/// When it finds pg is in `Inconsistent`,
+/// it will send the `HealReq` to secondary, aiming to heal this pg.
+pub struct HealReq {
+    pub pgid: PgId,
+    pub epoch: TargetMapVersion,
+    pub heal_data: HealData,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<PgVersion>")]
-pub struct PeerConsult {
+pub struct PgConsult {
     pub epoch: TargetMapVersion,
     pub pgid: PgId,
 }
 
-#[derive(Serialize, Deserialize, Request)]
+#[derive(Clone, Serialize, Deserialize, Request)]
 #[rtype("Result<()>")]
 pub struct PeerFinish {
     pub epoch: TargetMapVersion,
     pub pgid: PgId,
-    pub heal: HealRes,
+    pub heal_data: HealData,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Request)]
-#[rtype("Result<HealRes>")]
-pub struct HealReq {
+#[rtype("Result<HealData>")]
+pub struct FetchHealData {
     pub pgid: PgId,
     pub pg_ver: PgVersion,
     pub epoch: TargetMapVersion,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct HealRes {
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealData {
     pub logs: Vec<(PgVersion, Put)>,
     pub snapshot: Option<(PgVersion, Vec<u8>)>,
 }
@@ -101,7 +112,7 @@ impl KvRequest for Put {
     }
 }
 
-impl EpochRequest for PeerConsult {
+impl EpochRequest for PgConsult {
     fn epoch(&self) -> TargetMapVersion {
         self.epoch
     }
@@ -131,13 +142,19 @@ impl EpochRequest for ForwardReq {
     }
 }
 
-impl EpochRequest for HealReq {
+impl EpochRequest for FetchHealData {
     fn epoch(&self) -> TargetMapVersion {
         self.epoch
     }
 }
 
 impl EpochRequest for PgHeartbeat {
+    fn epoch(&self) -> TargetMapVersion {
+        self.epoch
+    }
+}
+
+impl EpochRequest for HealReq {
     fn epoch(&self) -> TargetMapVersion {
         self.epoch
     }
@@ -150,8 +167,8 @@ impl Display for PeerFinish {
             "PeerFinish {{ pgid: {}, epoch: {}, snapshot_id :{:?}, log length: {} }}",
             self.pgid,
             self.epoch,
-            self.heal.snapshot.as_ref().map(|x| x.0),
-            self.heal.logs.len()
+            self.heal_data.snapshot.as_ref().map(|x| x.0),
+            self.heal_data.logs.len()
         )
     }
 }

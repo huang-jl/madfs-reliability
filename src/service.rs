@@ -55,7 +55,7 @@ impl Store for KvService {
     }
 
     fn push_pg_data(&mut self, pgid: PgId, data: Vec<u8>) {
-        //1. clear the potential pgid's data
+        //1. clear the pg data
         let keys = self
             .kv
             .range(
