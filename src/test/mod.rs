@@ -8,7 +8,7 @@ pub use common::{create_monitor, gen_random_put, Client, KvServerCluster};
 use futures::stream::{FuturesUnordered, StreamExt};
 use log::warn;
 use madsim::time::sleep;
-use std::{collections::HashMap, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 pub mod common;
 
@@ -34,7 +34,7 @@ async fn cluster_simple_test() {
 
     // Wait for the cluster to start up (peering)
     sleep(Duration::from_secs(5)).await;
-    let mut golden = HashMap::new();
+    let mut golden = BTreeMap::new();
 
     for _ in 0..1000 {
         let (key, value) = gen_random_put(10, 20);
@@ -74,7 +74,7 @@ async fn one_pg_crash_and_up() {
         MonitorClient::new(str_to_addr(MONITOR_ADDR)).await.unwrap(),
     );
 
-    let mut golden = HashMap::new();
+    let mut golden = BTreeMap::new();
 
     // Wait for the cluster to start up (peering)
     sleep(Duration::from_secs(5)).await;
@@ -168,7 +168,7 @@ async fn crash_and_up() {
         MonitorClient::new(str_to_addr(MONITOR_ADDR)).await.unwrap(),
     );
 
-    let mut golden = HashMap::new();
+    let mut golden = BTreeMap::new();
 
     // Wait for the cluster to start up (peering)
     sleep(Duration::from_millis(5000)).await;

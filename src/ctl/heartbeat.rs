@@ -3,8 +3,8 @@ use crate::call_timeout_retry;
 use crate::constant::{PG_HEARTBEAT_TIMEOUT, RETRY_TIMES};
 use crate::rpc::PgHeartbeat;
 use crate::{service::Store, PgId};
-use futures::stream::{FuturesOrdered, FuturesUnordered, StreamExt};
-use log::{debug, error, warn};
+use futures::stream::{FuturesUnordered, StreamExt};
+use log::{error, warn};
 use madsim::time::sleep;
 use std::time::Duration;
 
@@ -72,7 +72,7 @@ where
                         call_timeout_retry(addr, request, PG_HEARTBEAT_TIMEOUT, RETRY_TIMES).await
                     }
                 })
-                .collect::<FuturesOrdered<_>>();
+                .collect::<FuturesUnordered<_>>();
         while let Some(res) = requests.next().await {
             res??;
         }

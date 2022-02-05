@@ -8,7 +8,7 @@
 use super::{call_timeout_retry, PgState, ReliableCtl};
 use crate::{PgId, PgVersion, Result, constant::*, ctl::PgInfo, monitor::TargetMap, rpc::{FetchHealData, PeerFinish, PgConsult}, service::Store};
 use futures::{
-    join, select,
+    join, select_biased,
     stream::{FuturesOrdered, FuturesUnordered, StreamExt},
     FutureExt,
 };
@@ -79,7 +79,7 @@ where
                     );
                 }
             }
-            select! {
+            select_biased! {
                 () = self.monitor_client
                 .watch_for_target_map(Some(target_map.get_version()))
                 .fuse() => {},

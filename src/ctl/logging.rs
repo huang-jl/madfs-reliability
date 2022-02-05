@@ -8,13 +8,11 @@ use log::{debug, warn};
 use madsim::fs::{self, File};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-// TODO: consider snapshot
-
 /// `LogManager` is responsible for maintaining logs for *each pg*.
 pub struct LogManager {
     /// upper bound of log index for each pg (exclude, e.g. 5 means valid id is < 5)
     uppers: Vec<AtomicU64>,
-    /// lower bound of log index for each pg (exclude, e.g. 5 means valid id is >= 5)
+    /// lower bound of log index for each pg (include, e.g. 5 means valid id is >= 5)
     lowers: Vec<AtomicU64>,
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
 }

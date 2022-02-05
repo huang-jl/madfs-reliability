@@ -16,7 +16,7 @@ use log::{debug, error};
 use madsim::{fs, net::NetLocalHandle, task, time::Instant};
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::HashMap,
+    collections::BTreeMap,
     fmt::Debug,
     net::SocketAddr,
     sync::{
@@ -63,10 +63,10 @@ struct Inner<T> {
     service: Mutex<T>,
     logger: LogManager,
     distributor: Box<dyn Distributor<REPLICA_SIZE>>,
-    pgs: StdMutex<HashMap<PgId, PgInfo>>,
+    pgs: StdMutex<BTreeMap<PgId, PgInfo>>,
     /// Recording the next index (e.g. 5 means the next operation will be assigned index 5)
     sequencer: Vec<AtomicU64>,
-    wakers: StdMutex<HashMap<PgId, HashMap<u64, Waker>>>,
+    wakers: StdMutex<BTreeMap<PgId, BTreeMap<u64, Waker>>>,
 }
 
 #[derive(Debug, Clone)]
@@ -384,9 +384,9 @@ where
             service: Mutex::new(service),
             logger,
             distributor: Box::new(SimpleHashDistributor::new(pg_num)),
-            pgs: StdMutex::new(HashMap::new()),
+            pgs: StdMutex::new(BTreeMap::new()),
             sequencer,
-            wakers: StdMutex::new(HashMap::new()),
+            wakers: StdMutex::new(BTreeMap::new()),
         }
     }
     /*
@@ -547,7 +547,7 @@ impl<'a, T> Future for ApplyTask<'a, T> {
         let mut pgs = self.inner.pgs.lock().unwrap();
         let mut global_wakers = self.inner.wakers.lock().unwrap();
         let info = pgs.entry(self.pgid).or_insert(PgInfo::default());
-        let wakers = global_wakers.entry(self.pgid).or_insert(HashMap::new());
+        let wakers = global_wakers.entry(self.pgid).or_insert(BTreeMap::new());
         if info.applied_ptr == self.log_id {
             return std::task::Poll::Ready(());
         }

@@ -3,6 +3,7 @@ use std::fmt::Display;
 use crate::{monitor::*, PgId, PgVersion, Result, TargetMapVersion};
 use madsim::{net::rpc::Request, Request};
 use serde::{Deserialize, Serialize};
+use madsim_reliability_macros::EpochRequest;
 
 pub trait KvRequest: Request {
     fn key(&self) -> &str;
@@ -14,14 +15,14 @@ pub trait EpochRequest {
     fn epoch(&self) -> TargetMapVersion;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[derive(Debug, Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<Option<Vec<u8>>>")]
 pub struct Get {
     pub epoch: TargetMapVersion,
     pub key: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[derive(Debug, Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<()>")]
 pub struct Put {
     pub key: String,
@@ -29,7 +30,7 @@ pub struct Put {
     pub epoch: TargetMapVersion,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[derive(Debug, Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<()>")]
 pub struct ForwardReq {
     pub id: u64,
@@ -37,7 +38,7 @@ pub struct ForwardReq {
     pub epoch: TargetMapVersion,
 }
 
-#[derive(Clone, Serialize, Deserialize, Request)]
+#[derive(Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<()>")]
 /// Primary checks pgs periodically.
 /// When it finds pg is in `Inconsistent`,
@@ -48,14 +49,14 @@ pub struct HealReq {
     pub heal_data: HealData,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[derive(Debug, Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<PgVersion>")]
 pub struct PgConsult {
     pub epoch: TargetMapVersion,
     pub pgid: PgId,
 }
 
-#[derive(Clone, Serialize, Deserialize, Request)]
+#[derive(Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<()>")]
 pub struct PeerFinish {
     pub epoch: TargetMapVersion,
@@ -63,7 +64,7 @@ pub struct PeerFinish {
     pub heal_data: HealData,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[derive(Debug, Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<HealData>")]
 pub struct FetchHealData {
     pub pgid: PgId,
@@ -77,7 +78,7 @@ pub struct HealData {
     pub snapshot: Option<(PgVersion, Vec<u8>)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, Request)]
+#[derive(Debug, Clone, Serialize, Deserialize, Request, EpochRequest)]
 #[rtype("Result<()>")]
 pub struct PgHeartbeat {
     pub pgid: PgId,
@@ -112,53 +113,6 @@ impl KvRequest for Put {
     }
 }
 
-impl EpochRequest for PgConsult {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
-
-impl EpochRequest for PeerFinish {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
-
-impl EpochRequest for Get {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
-
-impl EpochRequest for Put {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
-
-impl EpochRequest for ForwardReq {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
-
-impl EpochRequest for FetchHealData {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
-
-impl EpochRequest for PgHeartbeat {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
-
-impl EpochRequest for HealReq {
-    fn epoch(&self) -> TargetMapVersion {
-        self.epoch
-    }
-}
 
 impl Display for PeerFinish {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
